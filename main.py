@@ -35,7 +35,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ======================== НАСТРОЙКИ И КЛЮЧИ ========================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
@@ -70,7 +69,7 @@ PLANS = {
     },
     "sub_7d": {
         "title": "🗓 Безлимит на 7 дней",
-        "description": "Неограниченные проверки шмота на 1 неделю",
+        "description": "Неограниченные проверки на 1 неделю",
         "stars": 95,
         "uah": 110,
         "type": "days",
@@ -78,7 +77,7 @@ PLANS = {
     },
     "sub_30d": {
         "title": "👑 Безлимит на 30 дней",
-        "description": "Полный безлимит на месяц (Хит для ресейлеров)",
+        "description": "Полный безлимит на месяц (Хит для ресейла)",
         "stars": 190,
         "uah": 220,
         "type": "days",
@@ -94,13 +93,13 @@ PLANS = {
     }
 }
 
+# Приоритет проверенных актуальных моделей Gemini
 CANDIDATE_MODELS = [
+    "gemini-3.6-flash",
     "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-3.6-flash"
+    "gemini-2.5-flash-lite"
 ]
 
-# ======================== БАЗА ДАННЫХ ========================
 def init_db():
     with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
@@ -286,47 +285,56 @@ except Exception as err:
     logger.error(f"Ошибка настройки Gemini API: {err}")
     ai_client = None
 
+# Полностью универсальный промпт для ЛЮБОЙ одежды, обуви и аксессуаров любых брендов
 ANALYSIS_PROMPT = """
-Ты — профессиональный эксперт по ресейлу одежды, обуви (кроссовок) и легит-чеку.
+Ты — профессиональный эксперт по ресейлу, оценке и легит-чеку ЛЮБОЙ одежды, обуви (кроссовок) и аксессуаров.
 Тебе отправлены 3 фотографии одной вещи:
-1) Общий вид (одежда или пара кроссовок).
-2) Бирка горловины/воротника (для одежды) ИЛИ бирка на язычке/внешний логотип (для обуви).
-3) Сервисная бирка (wash tag Inditex/Zara/Nike с составом и артикулом) ИЛИ размерная бирка кроссовок со style-code.
+1) Общий план вещи (одежда, кроссовки, куртка, сумка).
+2) Главная бирка / логотип / бирка на воротнике (для одежды) ИЛИ язычок / внешний брендинг (для обуви).
+3) Внутренний сервисный ярлык (состав, фабричный артикул, wash tag) ИЛИ размерный ярлык кроссовок со style-code и штрихкодом.
 
-ПРАВИЛА ОЦЕНКИ И РАСПОЗНАВАНИЯ:
-1. ZARA И БРЕНДЫ INDITEX (Pull&Bear, Bershka, Massimo Dutti):
-   - Если на бирке написано "grupo INDITEX" и указан артикул вида 7545/442/800 или длинный штрихкод — это 100% ОРИГИНАЛ концерна Inditex (линейки Zara Man, Basic, TRF).
-   - Масс-маркет НЕ подделывают. Вердикт: "100% Оригинал".
-2. ОБУВЬ И КРОССОВКИ:
-   - Ищи style-code артикул (Nike, adidas, New Balance) и оценивай шрифты размерной сетки.
-3. ЦЕНОВАЯ ОЦЕНКА (ВТОРИЧКА УКРАИНЫ, OLX / ШАФА):
-   - Футболки Zara/Pull&Bear: 100–250 грн ($2.5–$6).
-   - Рубашки/свитшоты Zara: 200–450 грн ($5–$11).
-   - Куртки/пальто Zara: 500–1200 грн ($12–$30).
-   - Кроссовки: по рынку OLX и eBay Sold.
+ТВОЯ ЗАДАЧА:
+1. ОПРЕДЕЛИТЬ БРЕНД И МОДЕЛЬ:
+   - Внимательно прочитай текст, артикулы, цифры, штрихкоды и логотипы на всех бирках (даже если фото перевернуто или под углом).
+   - Определи категорию: Масс-маркет / Стритвир и Ворквир / Спортивный бренд / Премиум и Люкс / Винтаж.
 
-КРИТИЧЕСКИ ВАЖНО ПО ФОРМАТУ JSON:
-- Верни СТРОГИЙ валидный JSON.
-- Внутри текстовых значений НИКОГДА НЕ ИСПОЛЬЗУЙ двойные кавычки "..." (заменяй их на одинарные '...').
+2. ПРОВЕСТИ ЛЕГИТ-ЧЕК:
+   - Оцени оригинальность: шрифты, ровность строчек, наличие фабричных кодов (RN, CA, style-code, Certilogo, QR-коды, штрихкоды).
+   - Для масс-маркета (Zara, Pull&Bear, Bershka, H&M, Uniqlo, Mango и др.): если бирки фабричные — оригинальность 99-100% (масс-маркет не подделывают).
+   - Для кроссовок (Nike, adidas, New Balance, Jordan, ASICS): проверь соответствие style-code и формат размерной сетки.
+   - Сформулируй четкие причины вердикта (legit_reasons).
 
-Шаблон ответа:
+3. ОЦЕНИТЬ РЕАЛЬНУЮ РЫНОЧНУЮ СТОИМОСТЬ (ВТОРИЧКА УКРАИНЫ И МИР):
+   - Оцени адекватную вилку цен для продажи б/у вещи в хорошем состоянии:
+     * price_uah_min / price_uah_max (в гривнах для Shafa.ua и OLX).
+     * price_usd_min / price_usd_max (в долларах для eBay и Grailed).
+
+4. СФОРМИРОВАТЬ ТОЧНЫЕ ПОИСКОВЫЕ ЗАПРОСЫ (2-3 СЛОВА):
+   - search_query_local: бренд + тип вещи на русском/украинском (например: "Nike кроссовки мужские", "Carhartt куртка").
+   - search_query_global: бренд + линейка/модель латиницей (например: "Nike Dunk Low", "Carhartt Detroit jacket").
+
+КРИТИЧЕСКИЕ ТРЕБОВАНИЯ К ФОРМАТУ ОТВЕТА:
+- Верни ИСКЛЮЧИТЕЛЬНО валидный JSON без оберток markdown (без ```json).
+- Внутри строковых значений НЕ используй двойные кавычки (заменяй их на одинарные ').
+
+Структура JSON:
 {
-  "brand": "Zara",
-  "category_tier": "Масс-маркет",
-  "item_name": "Рубашка хлопок (линейка Inditex)",
-  "era_or_year": "2020-2023",
-  "authenticity_verdict": "100% Оригинал",
-  "authenticity_score": 98,
+  "brand": "Точное название бренда",
+  "category_tier": "Категория вещи",
+  "item_name": "Название модели или тип вещи",
+  "era_or_year": "Примерные годы выпуска",
+  "authenticity_verdict": "100% Оригинал / Оригинал / Сомнительно / Подделка",
+  "authenticity_score": 95,
   "legit_reasons": [
-    "Оригинальный сервисный ярлык grupo INDITEX",
-    "Фабричный артикул и штрихкод соответствуют стандартам бренда"
+    "Первая конкретная причина вердикта по бирке/швам",
+    "Вторая причина по артикулу/материалам"
   ],
-  "price_uah_min": 200,
-  "price_uah_max": 400,
-  "price_usd_min": 5,
-  "price_usd_max": 10,
-  "search_query_local": "Zara рубашка мужская",
-  "search_query_global": "Zara shirt men"
+  "price_uah_min": 300,
+  "price_uah_max": 600,
+  "price_usd_min": 8,
+  "price_usd_max": 15,
+  "search_query_local": "Бренд тип вещи",
+  "search_query_global": "Brand model name"
 }
 """
 
@@ -344,9 +352,10 @@ def generate_marketplace_links(query_local: str, query_global: str) -> dict[str,
 def prepare_image_part_sync(file_bytes: bytes) -> genai_types.Part:
     with Image.open(io.BytesIO(file_bytes)) as img:
         img = img.convert("RGB")
-        img.thumbnail((800, 800), Image.Resampling.BILINEAR)
+        # 1024px сохраняет четкость любого мелкого шрифта и артикула
+        img.thumbnail((1024, 1024), Image.Resampling.BILINEAR)
         out_buf = io.BytesIO()
-        img.save(out_buf, format="JPEG", quality=70, optimize=False)
+        img.save(out_buf, format="JPEG", quality=75, optimize=False)
         return genai_types.Part.from_bytes(data=out_buf.getvalue(), mime_type="image/jpeg")
 
 async def fetch_and_prep_photo(bot_instance: Bot, file_id: str) -> genai_types.Part:
@@ -356,55 +365,75 @@ async def fetch_and_prep_photo(bot_instance: Bot, file_id: str) -> genai_types.P
     return await asyncio.to_thread(prepare_image_part_sync, stream.getvalue())
 
 def extract_clean_json(text: str) -> dict:
-    """Умное извлечение JSON: убирает markdown и чинит случайные кавычки внутри текста."""
     cleaned = text.strip()
     if cleaned.startswith("```"):
         cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
         cleaned = re.sub(r"\s*```$", "", cleaned)
     
-    match = re.search(r"\{.*\}", cleaned, re.DOTALL)
-    if match:
-        cleaned = match.group(0)
+    start_idx = cleaned.find("{")
+    end_idx = cleaned.rfind("}")
+    if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+        cleaned = cleaned[start_idx:end_idx + 1]
 
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError:
-        # Автоматическая замена некорректных внутренних кавычек
-        sanitized = re.sub(r'(:\s*")([^"]*)"([^"]*)(")', r'\1\2\'\3\4', cleaned)
-        return json.loads(sanitized)
+        pass
+
+    try:
+        # Устраняем случайные запятые перед закрывающими скобками
+        fixed = re.sub(r",\s*([}\]])", r"\1", cleaned)
+        # Устраняем внутренние некорректные кавычки
+        fixed = re.sub(r'(:\s*")([^"]*)"([^"]*)(")', r'\1\2\'\3\4', fixed)
+        return json.loads(fixed)
+    except Exception:
+        logger.warning(f"Не удалось распарсить JSON: {cleaned[:200]}")
+        raise ValueError("AI вернул некорректную структуру данных")
 
 async def analyze_with_gemini_fallback(image_parts: list[genai_types.Part]) -> dict:
     if not ai_client:
-        raise RuntimeError("GEMINI_API_KEY не установлен в переменных окружения.")
+        raise RuntimeError("Ключ GEMINI_API_KEY не установлен в настройках.")
 
     last_error = None
     for model_name in CANDIDATE_MODELS:
-        for attempt in range(2):
-            try:
-                logger.info(f"Отправка запроса к {model_name} (попытка {attempt + 1})...")
-                response = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        ai_client.models.generate_content,
-                        model=model_name,
-                        contents=[*image_parts, ANALYSIS_PROMPT],
-                        config=genai_types.GenerateContentConfig(
-                            response_mime_type="application/json",
-                            temperature=0.1
-                        )
-                    ),
-                    timeout=55.0  # Даем запас времени на чтение мелких бирок
-                )
-                if response and response.text:
-                    return extract_clean_json(response.text)
-            except Exception as exc:
-                err_str = str(exc)
-                logger.warning(f"Ошибка модели {model_name}: {err_str}")
-                last_error = exc
-                if "404" in err_str or "NOT_FOUND" in err_str:
-                    break
-                # Если сработал лимит запросов, ждем 2.5 секунды перед ретраем
-                await asyncio.sleep(2.5)
-    raise last_error or RuntimeError("Нейросеть временно не смогла обработать запрос.")
+        try:
+            logger.info(f"Запрос к модели {model_name}...")
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    ai_client.models.generate_content,
+                    model=model_name,
+                    contents=[*image_parts, ANALYSIS_PROMPT],
+                    config=genai_types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        temperature=0.1
+                    )
+                ),
+                timeout=55.0
+            )
+
+            raw_text = None
+            if response and response.text:
+                raw_text = response.text
+            elif response and response.candidates and len(response.candidates) > 0:
+                parts = response.candidates[0].content.parts if response.candidates[0].content else []
+                text_chunks = [p.text for p in parts if hasattr(p, "text") and p.text]
+                if text_chunks:
+                    raw_text = "".join(text_chunks)
+
+            if raw_text:
+                return extract_clean_json(raw_text)
+            else:
+                last_error = RuntimeError(f"Модель {model_name} вернула пустой ответ.")
+        except Exception as exc:
+            err_str = str(exc)
+            logger.warning(f"Ошибка модели {model_name}: {err_str}")
+            last_error = exc
+            if "404" in err_str or "NOT_FOUND" in err_str:
+                continue
+            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                await asyncio.sleep(2.0)
+                continue
+    raise last_error or RuntimeError("Все AI-модели временно недоступны.")
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else None
 dp = Dispatcher(storage=MemoryStorage())
@@ -434,11 +463,11 @@ async def cmd_start(message: Message, state: FSMContext):
     welcome_text = (
         f"👋 Привет, <b>{name}</b>!\n\n"
         "Я — <b>Resale & Legit Checker Bot</b>.\n"
-        "Помогу быстро оценить одежду или кроссовки:\n"
-        "• Распознаю бренд, точный артикул и линейку\n"
-        "• Проведу легит-чек по биркам и штрихкодам\n"
-        "• Покажу реальную цену в Украине и проданные пары на eBay\n"
-        "• Сгенерирую готовые поисковые ссылки на Shafa.ua, OLX, eBay, Grailed\n\n"
+        "Универсальный помощник для оценки любой одежды и обуви:\n"
+        "• Распознаю любой бренд, точную модель и артикул\n"
+        "• Проведу экспертный легит-чек по биркам, штрихкодам и фурнитуре\n"
+        "• Покажу реальную стоимость на вторичке (Шафа, OLX) и проданные пары на eBay\n"
+        "• Сгенерирую готовые поисковые ссылки на маркетплейсы\n\n"
         f"📊 Твой статус: <b>{html.escape(u['status_text'])}</b>."
     )
     await message.answer(welcome_text, parse_mode="HTML", reply_markup=get_main_menu_keyboard())
@@ -572,7 +601,7 @@ async def cb_pay_mono(callback: CallbackQuery):
         f"💳 <b>Оплата через Monobank Банку:</b>\n\n"
         f"Тариф: <b>{html.escape(plan['title'])}</b>\n"
         f"Сумма к оплате: <b>{plan['uah']} грн</b>\n\n"
-        f"⚠️ <b>ВАЖНО:</b> При оплате в поле «Коментар» ОБЯЗАТЕЛЬНО укажите ваш ID:\n"
+        f"⚠️ <b>ВАЖНО:</b> При оплате в поле «Коментар» укажите ваш ID:\n"
         f"👉 <code>ID: {user_id}</code> (нажмите, чтобы скопировать)\n\n"
         "После перевода нажмите кнопку <b>«🔄 Проверить оплату»</b> ниже 👇"
     )
@@ -581,13 +610,13 @@ async def cb_pay_mono(callback: CallbackQuery):
         [InlineKeyboardButton(text=f"↗️ Перейти в Банку ({plan['uah']} грн)", url=jar_payment_link)],
         [InlineKeyboardButton(text="🔄 Проверить оплату", callback_data=f"check_mono:{plan_key}")],
         [InlineKeyboardButton(text="📩 Я оплатил (Отправить чек админу)", callback_data=f"notify_admin_mono:{plan_key}")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="show_plans")]
+        [InlineKeyboardButton(text="◀️ Назад к тарифам", callback_data="show_plans")]
     ])
     
     try:
         await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
     except Exception as e:
-        logger.warning(f"edit_text error in pay_mono, fallback to answer: {e}")
+        logger.warning(f"edit_text error in pay_mono: {e}")
         await callback.message.answer(text, parse_mode="HTML", reply_markup=kb)
 
 @dp.callback_query(F.data.startswith("check_mono:"))
@@ -740,7 +769,7 @@ async def cb_admin_approve(callback: CallbackQuery):
                 f"🎉 <b>Ваша оплата подтверждена!</b>\n\n"
                 f"Тариф: <b>{html.escape(plan['title'])}</b> успешно начислен.\n"
                 f"📊 Ваш статус: <b>{html.escape(u['status_text'])}</b>.\n\n"
-                "Приятных проверок вещей и кроссовок!",
+                "Приятных проверок вещей!",
                 parse_mode="HTML",
                 reply_markup=get_main_menu_keyboard()
             )
@@ -779,8 +808,8 @@ async def cb_start_check(callback: CallbackQuery, state: FSMContext):
 
     await state.set_state(ClothingCheckFSM.waiting_for_main_photo)
     await callback.message.answer(
-        "📸 <b>Шаг 1 из 3:</b>\n"
-        "Пришлите фотографию <b>вещи или обуви целиком</b> (общий план).",
+        "📸 <b>Шаг 1 из 3: Общий вид</b>\n\n"
+        "Пришлите фотографию <b>вещи или пары обуви целиком</b>.",
         parse_mode="HTML"
     )
 
@@ -789,8 +818,8 @@ async def process_main_photo(message: Message, state: FSMContext):
     await state.update_data(main_photo=message.photo[-1].file_id)
     await state.set_state(ClothingCheckFSM.waiting_for_neck_tag)
     await message.answer(
-        "🏷 <b>Шаг 2 из 3:</b>\n"
-        "Отлично! Теперь сфотографируйте <b>бирку на воротнике/горловине</b> (для одежды) или <b>бирку на язычке / внешний логотип</b> (для кроссовок).",
+        "🏷 <b>Шаг 2 из 3: Главная бирка / Логотип</b>\n\n"
+        "Сфотографируйте <b>бирку на воротнике/горловине</b> (для одежды) либо <b>язычок / внешний логотип</b> (для обуви).",
         parse_mode="HTML"
     )
 
@@ -799,8 +828,8 @@ async def process_neck_tag_photo(message: Message, state: FSMContext):
     await state.update_data(neck_photo=message.photo[-1].file_id)
     await state.set_state(ClothingCheckFSM.waiting_for_care_tag)
     await message.answer(
-        "🧵 <b>Шаг 3 из 3:</b>\n"
-        "Последний шаг: отправьте <b>нижнюю сервисную бирку</b> (с артикулом и составом) или <b>внутреннюю размерную бирку кроссовок</b> со style-code.",
+        "🧵 <b>Шаг 3 из 3: Сервисный ярлык / Размерная бирка</b>\n\n"
+        "Отправьте <b>внутреннюю бирку с составом и артикулом</b> (wash tag) либо <b>размерную бирку кроссовок со style-code</b>.",
         parse_mode="HTML"
     )
 
@@ -808,7 +837,11 @@ async def process_neck_tag_photo(message: Message, state: FSMContext):
 async def process_care_tag_photo(message: Message, state: FSMContext):
     user_data = await state.get_data()
     await state.clear()
-    status_msg = await message.answer("⏳ Распознаю артикул Inditex/Zara и сверяю базу цен... 4–6 секунд.")
+    status_msg = await message.answer(
+        "🔍 <b>Анализирую вещь через AI...</b>\n"
+        "Считываю артикулы, проверяю оригинальность и сверяю цены на рынке.",
+        parse_mode="HTML"
+    )
 
     try:
         image_parts = await asyncio.gather(
@@ -821,10 +854,10 @@ async def process_care_tag_photo(message: Message, state: FSMContext):
         decrement_check(message.from_user.id)
         u = get_user_data(message.from_user.id)
 
-        brand = html.escape(str(data.get("brand", "Не указан")))
+        brand = html.escape(str(data.get("brand", "Не определен")))
         item_name = html.escape(str(data.get("item_name", "Вещь / Обувь")))
         tier = html.escape(str(data.get("category_tier", "Масс-маркет")))
-        era = html.escape(str(data.get("era_or_year", "Неизвестно")))
+        era = html.escape(str(data.get("era_or_year", "Не указан")))
         verdict = html.escape(str(data.get("authenticity_verdict", "Проверено")))
 
         local_q = data.get("search_query_local") or f"{brand} {item_name}"
@@ -832,7 +865,7 @@ async def process_care_tag_photo(message: Message, state: FSMContext):
         links = generate_marketplace_links(local_q, global_q)
 
         reasons_list = data.get("legit_reasons", [])
-        reasons_formatted = "\n".join([f"  • {html.escape(str(r))}" for r in reasons_list]) if reasons_list else "  • Детали и бирки соответствуют стандартам бренда"
+        reasons_formatted = "\n".join([f"  • {html.escape(str(r))}" for r in reasons_list]) if reasons_list else "  • Детали и фурнитура соответствуют стандартам бренда"
 
         score = data.get("authenticity_score", 50)
         score_emoji = "🟢" if score >= 75 else ("🟡" if score >= 45 else "🔴")
@@ -875,19 +908,27 @@ async def process_care_tag_photo(message: Message, state: FSMContext):
         await message.answer(result_message, parse_mode="HTML", reply_markup=kb)
 
     except (json.JSONDecodeError, ValueError) as json_err:
-        logger.warning(f"Ошибка парсинга JSON: {json_err}")
+        logger.warning(f"Ошибка парсинга ответа: {json_err}")
         try:
             await status_msg.edit_text(
-                "🔍 <b>Не удалось чётко прочесть бирку.</b>\n\n"
-                "Сделайте фото сервисного ярлыка ближе и в фокусе, чтобы цифры артикула были различимы.",
+                "🔍 <b>Не удалось четко распознать бирку или текст.</b>\n\n"
+                "Сделайте фото ярлыка ближе, с хорошим освещением и в фокусе, чтобы цифры и штрихкод были разборчивы.",
                 parse_mode="HTML"
             )
         except Exception:
             pass
     except Exception as exc:
+        err_msg = str(exc)
         logger.error(f"Ошибка при обработке запроса: {exc}", exc_info=True)
+        if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
+            err_text = "⏳ Превышен лимит запросов к AI. Пожалуйста, подождите 30 секунд и повторите попытку."
+        elif "404" in err_msg or "NOT_FOUND" in err_msg:
+            err_text = "⚠️ Модель AI временно недоступна. Попробуйте еще раз через полминуты."
+        else:
+            err_text = f"❌ Не удалось обработать вещь. Причина: {html.escape(err_msg[:120])}"
+
         try:
-            await status_msg.edit_text("❌ Сервера Gemini кратковременно перегружены. Повторите попытку через минуту.")
+            await status_msg.edit_text(err_text, parse_mode="HTML")
         except Exception:
             pass
 
