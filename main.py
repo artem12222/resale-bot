@@ -43,6 +43,8 @@ ADMIN_USER_ID = 5641374843
 
 # Ссылка на твою Банку (без токенов, чистая ссылка для перевода)
 MONOBANK_JAR_URL = "https://send.monobank.ua/jar/7E9CVK1jX1"
+# Токен API Монобанка для автоматической проверки выписок
+MONOBANK_TOKEN = os.getenv("MONOBANK_TOKEN", "")
 
 FREE_CHECKS_PER_DAY = 3
 DB_NAME = "resale_bot.db"
@@ -543,15 +545,101 @@ async def cb_pay_mono(callback: CallbackQuery):
         f"Сумма к оплате: <b>{plan['uah']} грн</b>\n\n"
         f"⚠️ <b>ВАЖНО:</b> При оплате в поле «Коментар» ОБЯЗАТЕЛЬНО укажите ваш ID:\n"
         f"👉 <code>ID: {user_id}</code> (нажмите, чтобы скопировать)\n\n"
-        "После перевода нажмите кнопку <b>«📩 Я оплатил (Отправить чек админу)»</b> ниже 👇"
+        "После перевода нажмите кнопку <b>«🔄 Проверить оплату»</b> ниже 👇"
     )
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"↗️ Перейти в Банку ({plan['uah']} грн)", url=jar_payment_link)],
+        [InlineKeyboardButton(text="🔄 Проверить оплату", callback_data=f"check_mono:{plan_key}")],
         [InlineKeyboardButton(text="📩 Я оплатил (Отправить чек админу)", callback_data=f"notify_admin_mono:{plan_key}")],
         [InlineKeyboardButton(text="◀️ Назад", callback_data="show_plans")]
     ])
     await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+
+@dp.callback_query(F.data.startswith("check_mono:"))
+async def cb_check_monobank_statement(callback: CallbackQuery):
+    """Автоматическая проверка выписки Банки через официальный Monobank API."""
+    await callback.answer("Проверяю поступления на Банку...", show_alert=False)
+    plan_key = callback.data.split(":")[1]
+    plan = PLANS.get(plan_key)
+    user_id = callback.from_user.id
+
+    if not MONOBANK_TOKEN:
+        await callback.message.answer(
+            "⚠️ Авто-проверка через API не подключена (в настройках сервера не указан MONOBANK_TOKEN).\n\n"
+            "Нажмите кнопку <b>«📩 Я оплатил (Отправить чек админу)»</b>, и администратор подтвердит платеж вручную!",
+            parse_mode="HTML"
+        )
+        return
+
+    try:
+        headers = {"X-Token": MONOBANK_TOKEN}
+        now_ts = int(datetime.now().timestamp())
+        from_ts = now_ts - 7200  # проверяем платежи за последние 2 часа
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get("https://api.monobank.ua/personal/client-info", headers=headers)
+            if resp.status_code == 429:
+                await callback.message.answer(
+                    "⏳ Monobank разрешает опрашивать выписку не чаще 1 раза в минуту.\nПожалуйста, подождите минуту и нажмите ещё раз.",
+                    parse_mode="HTML"
+                )
+                return
+
+            if resp.status_code != 200:
+                await callback.message.answer(
+                    "⚠️ Банк временно не отвечает. Нажмите кнопку <b>«📩 Я оплатил (Отправить чек админу)»</b>.",
+                    parse_mode="HTML"
+                )
+                return
+
+            client_info = resp.json()
+            jars = client_info.get("jars", [])
+            jar_account = jars[0].get("id") if jars else None
+
+            if not jar_account:
+                accounts = client_info.get("accounts", [])
+                jar_account = accounts[0].get("id") if accounts else None
+
+            if not jar_account:
+                await callback.message.answer("⚠️ Не удалось определить счет Банки. Нажмите «📩 Я оплатил».")
+                return
+
+            stmt_url = f"https://api.monobank.ua/personal/statement/{jar_account}/{from_ts}/{now_ts}"
+            stmt_resp = await client.get(stmt_url, headers=headers)
+
+            if stmt_resp.status_code == 200:
+                transactions = stmt_resp.json()
+                found = False
+                expected_kopecks = int(plan["uah"] * 100)
+
+                for tx in transactions:
+                    comment = str(tx.get("comment", "")) + " " + str(tx.get("description", ""))
+                    amount = tx.get("amount", 0)
+                    if str(user_id) in comment and amount >= expected_kopecks:
+                        found = True
+                        break
+
+                if found:
+                    activate_plan(user_id, plan_key, "monobank_auto", plan["uah"], "UAH")
+                    u = get_user_data(user_id)
+                    await callback.message.answer(
+                        f"🎉 <b>Оплата успешно найдена и подтверждена!</b>\n\n"
+                        f"Тариф <b>{html.escape(plan['title'])}</b> активирован.\n"
+                        f"📊 Ваш новый баланс: <b>{html.escape(u['status_text'])}</b>",
+                        parse_mode="HTML",
+                        reply_markup=get_main_menu_keyboard()
+                    )
+                    return
+
+            await callback.message.answer(
+                "⏳ Платёж пока не найден в выписке Банки или вы забыли указать ваш ID в комментарии перевода.\n\n"
+                "Если деньги уже списались с карты, нажмите <b>«📩 Я оплатил (Отправить чек админу)»</b>.",
+                parse_mode="HTML"
+            )
+    except Exception as e:
+        logger.error(f"Ошибка проверки Монобанка: {e}")
+        await callback.message.answer("⚠️ Ошибка соединения с Monobank. Нажмите кнопку «📩 Я оплатил», чтобы передать чек админу.")
 
 @dp.callback_query(F.data.startswith("notify_admin_mono:"))
 async def cb_notify_admin_mono(callback: CallbackQuery):
