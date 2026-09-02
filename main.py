@@ -92,9 +92,8 @@ PLANS = {
 
 # Только стабильные и быстрые модели Google Gemini
 CANDIDATE_MODELS = [
+    "gemini-3.6-flash",
     "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-2.0-flash"
 ]
 
 def init_db():
