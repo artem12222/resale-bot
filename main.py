@@ -41,11 +41,10 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "5641374843"))
 
-# Железная защита ссылки на Банку Монобанка (гарантия валидного https:// URL)
-DEFAULT_MONO_JAR = "https://send.monobank.ua/jar/7E9CVK1jX1"
-raw_jar = os.getenv("MONOBANK_JAR_URL", "").strip().strip('"').strip("'")
-MONOBANK_JAR_URL = raw_jar if (raw_jar.startswith("https://") or raw_jar.startswith("http://")) else DEFAULT_MONO_JAR
-MONOBANK_JAR_URL = MONOBANK_JAR_URL.rstrip("/")
+RAW_JAR_URL = os.getenv("MONOBANK_JAR_URL", "https://send.monobank.ua/jar/7E9CVK1jX1").strip().strip('"').strip("'")
+if not RAW_JAR_URL.startswith("http"):
+    RAW_JAR_URL = "https://send.monobank.ua/jar/7E9CVK1jX1"
+MONOBANK_JAR_URL = RAW_JAR_URL
 
 MONOBANK_TOKEN = os.getenv("MONOBANK_TOKEN", "").strip()
 
@@ -95,14 +94,13 @@ PLANS = {
     }
 }
 
-# Только актуальные модели с быстрой отдачей
 CANDIDATE_MODELS = [
     "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
     "gemini-3.6-flash"
 ]
 
-# ======================== БАЗА ДАННЫХ С ЗАЩИТОЙ ТРАНЗАКЦИЙ ========================
+# ======================== БАЗА ДАННЫХ ========================
 def init_db():
     with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
@@ -140,7 +138,6 @@ def init_db():
             )
         """)
 
-        # Таблица для защиты от повторного использования чека и махинаций с 1 грн
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS processed_transactions (
                 tx_id TEXT PRIMARY KEY,
@@ -290,46 +287,46 @@ except Exception as err:
     ai_client = None
 
 ANALYSIS_PROMPT = """
-Ты — профессиональный эксперт по ресейлу, оценке одежды, обуви (кроссовок) и легит-чеку.
-Тебе отправлены 3 фотографии одной вещи или пары обуви:
-1) Общий вид (одежда целиком или пара кроссовок).
-2) Главная бирка: горловина/воротник (для одежды) ИЛИ бирка на язычке/логотип (для обуви/кроссовок).
-3) Сервисная бирка: wash tag с составом и артикулом (для одежды) ИЛИ размерная бирка со style-code/штрихкодом внутри обуви.
+Ты — профессиональный эксперт по ресейлу одежды, обуви (кроссовок) и легит-чеку.
+Тебе отправлены 3 фотографии одной вещи:
+1) Общий вид (одежда или пара кроссовок).
+2) Бирка горловины/воротника (для одежды) ИЛИ бирка на язычке/внешний логотип (для обуви).
+3) Сервисная бирка (wash tag Inditex/Zara/Nike с составом и артикулом) ИЛИ размерная бирка кроссовок со style-code.
 
-ВАЖНЫЕ ПРАВИЛА РАСПОЗНАВАНИЯ:
-1. КРОССОВКИ И ОБУВЬ:
-   - Считывай Style-Code / SKU артикул (например: Nike DD1391-100, adidas GW1229, New Balance BB550).
-   - Оценивай шрифты, даты производства, ровность строчки и бирку на язычке.
-2. ОДЕЖДА И БИРКИ:
-   - Если Pull & Bear и надпись STWD — это линейка STWD (Stay White Dope).
-   - Различай линейки Zara (Man, Woman, TRF, Origins).
-3. СЕГМЕНТ И РЕАЛЬНЫЕ РЫНОЧНЫЕ ЦЕНЫ (ВТОРИЧКА УКРАИНЫ И СНГ):
-   - "Масс-маркет" (Pull&Bear, Zara, Bershka, H&M): 99-100% оригинал. Цены: футболки 100–250 грн, худи/свитшоты 250–500 грн, куртки 400–900 грн.
-   - "Ворквир / Стритвир / Кроссовки" (Carhartt, Stussy, Nike, Jordan, adidas, New Balance): оценивай по проданным парам на eBay Sold и OLX/Shafa.
-   - "Премиум / Люкс" (Stone Island, CP Company, Ralph Lauren, Arc'teryx): строгий легит-чек.
+ПРАВИЛА ОЦЕНКИ И РАСПОЗНАВАНИЯ:
+1. ZARA И БРЕНДЫ INDITEX (Pull&Bear, Bershka, Massimo Dutti):
+   - Если на бирке написано "grupo INDITEX" и указан артикул вида 7545/442/800 или длинный штрихкод — это 100% ОРИГИНАЛ концерна Inditex (линейки Zara Man, Basic, TRF).
+   - Масс-маркет НЕ подделывают. Вердикт: "100% Оригинал".
+2. ОБУВЬ И КРОССОВКИ:
+   - Ищи style-code артикул (Nike, adidas, New Balance) и оценивай шрифты размерной сетки.
+3. ЦЕНОВАЯ ОЦЕНКА (ВТОРИЧКА УКРАИНЫ, OLX / ШАФА):
+   - Футболки Zara/Pull&Bear: 100–250 грн ($2.5–$6).
+   - Рубашки/свитшоты Zara: 200–450 грн ($5–$11).
+   - Куртки/пальто Zara: 500–1200 грн ($12–$30).
+   - Кроссовки: по рынку OLX и eBay Sold.
 
-4. ПОИСКОВЫЕ ЗАПРОСЫ (МАКСИМУМ 2-3 СЛОВА):
-   - search_query_local (OLX / Шафа): бренд + модель (например: "Nike Dunk Low", "Pull and Bear футболка").
-   - search_query_global (eBay / Grailed): бренд + модель + артикул (например: "Nike Dunk DD1391-100").
+КРИТИЧЕСКИ ВАЖНО ПО ФОРМАТУ JSON:
+- Верни СТРОГИЙ валидный JSON.
+- Внутри текстовых значений НИКОГДА НЕ ИСПОЛЬЗУЙ двойные кавычки "..." (заменяй их на одинарные '...').
 
-ОБЯЗАТЕЛЬНО верни валидный JSON без лишнего вступительного текста:
+Шаблон ответа:
 {
-  "brand": "Точное название бренда",
-  "category_tier": "Масс-маркет / Стритвир и Обувь / Премиум и Люкс",
-  "item_name": "Название модели или линейки",
-  "era_or_year": "Примерные годы выпуска",
-  "authenticity_verdict": "100% Оригинал / Оригинал / Фейк / Сомнительно",
-  "authenticity_score": 95,
+  "brand": "Zara",
+  "category_tier": "Масс-маркет",
+  "item_name": "Рубашка хлопок (линейка Inditex)",
+  "era_or_year": "2020-2023",
+  "authenticity_verdict": "100% Оригинал",
+  "authenticity_score": 98,
   "legit_reasons": [
-    "Оригинальные бирки и фабричные шрифты",
-    "Швы и артикул соответствуют стандартам бренда"
+    "Оригинальный сервисный ярлык grupo INDITEX",
+    "Фабричный артикул и штрихкод соответствуют стандартам бренда"
   ],
-  "price_uah_min": 150,
-  "price_uah_max": 250,
-  "price_usd_min": 4,
-  "price_usd_max": 7,
-  "search_query_local": "Nike Dunk Low",
-  "search_query_global": "Nike Dunk DD1391-100"
+  "price_uah_min": 200,
+  "price_uah_max": 400,
+  "price_usd_min": 5,
+  "price_usd_max": 10,
+  "search_query_local": "Zara рубашка мужская",
+  "search_query_global": "Zara shirt men"
 }
 """
 
@@ -345,7 +342,6 @@ def generate_marketplace_links(query_local: str, query_global: str) -> dict[str,
     }
 
 def prepare_image_part_sync(file_bytes: bytes) -> genai_types.Part:
-    """Ультра-быстрое сжатие до 800px: процессор Render не напрягается."""
     with Image.open(io.BytesIO(file_bytes)) as img:
         img = img.convert("RGB")
         img.thumbnail((800, 800), Image.Resampling.BILINEAR)
@@ -360,12 +356,22 @@ async def fetch_and_prep_photo(bot_instance: Bot, file_id: str) -> genai_types.P
     return await asyncio.to_thread(prepare_image_part_sync, stream.getvalue())
 
 def extract_clean_json(text: str) -> dict:
-    """Извлекает JSON даже если нейросеть добавила лишние слова или кавычки."""
+    """Умное извлечение JSON: убирает markdown и чинит случайные кавычки внутри текста."""
     cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+    
     match = re.search(r"\{.*\}", cleaned, re.DOTALL)
     if match:
         cleaned = match.group(0)
-    return json.loads(cleaned)
+
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        # Автоматическая замена некорректных внутренних кавычек
+        sanitized = re.sub(r'(:\s*")([^"]*)"([^"]*)(")', r'\1\2\'\3\4', cleaned)
+        return json.loads(sanitized)
 
 async def analyze_with_gemini_fallback(image_parts: list[genai_types.Part]) -> dict:
     if not ai_client:
@@ -375,7 +381,7 @@ async def analyze_with_gemini_fallback(image_parts: list[genai_types.Part]) -> d
     for model_name in CANDIDATE_MODELS:
         for attempt in range(2):
             try:
-                logger.info(f"Запрос к {model_name} (попытка {attempt + 1})...")
+                logger.info(f"Отправка запроса к {model_name} (попытка {attempt + 1})...")
                 response = await asyncio.wait_for(
                     asyncio.to_thread(
                         ai_client.models.generate_content,
@@ -383,21 +389,22 @@ async def analyze_with_gemini_fallback(image_parts: list[genai_types.Part]) -> d
                         contents=[*image_parts, ANALYSIS_PROMPT],
                         config=genai_types.GenerateContentConfig(
                             response_mime_type="application/json",
-                            temperature=0.2
+                            temperature=0.1
                         )
                     ),
-                    timeout=35.0
+                    timeout=55.0  # Даем запас времени на чтение мелких бирок
                 )
                 if response and response.text:
                     return extract_clean_json(response.text)
             except Exception as exc:
-                err_msg = str(exc)
-                logger.warning(f"Сбой модели {model_name}: {err_msg}")
+                err_str = str(exc)
+                logger.warning(f"Ошибка модели {model_name}: {err_str}")
                 last_error = exc
-                if "404" in err_msg or "NOT_FOUND" in err_msg:
+                if "404" in err_str or "NOT_FOUND" in err_str:
                     break
-                await asyncio.sleep(1.0)
-    raise last_error or RuntimeError("Нейросеть временно недоступна.")
+                # Если сработал лимит запросов, ждем 2.5 секунды перед ретраем
+                await asyncio.sleep(2.5)
+    raise last_error or RuntimeError("Нейросеть временно не смогла обработать запрос.")
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else None
 dp = Dispatcher(storage=MemoryStorage())
@@ -552,55 +559,39 @@ async def process_successful_stars_payment(message: Message):
 
 @dp.callback_query(F.data.startswith("pay_mono:"))
 async def cb_pay_mono(callback: CallbackQuery):
-    """Обработчик перехода к оплате Монобанка с защитой от сбоев URL."""
+    await callback.answer()
+    plan_key = callback.data.split(":")[1]
+    plan = PLANS.get(plan_key)
+    if not plan:
+        return
+
+    user_id = callback.from_user.id
+    jar_payment_link = f"{MONOBANK_JAR_URL}?a={plan['uah']}"
+
+    text = (
+        f"💳 <b>Оплата через Monobank Банку:</b>\n\n"
+        f"Тариф: <b>{html.escape(plan['title'])}</b>\n"
+        f"Сумма к оплате: <b>{plan['uah']} грн</b>\n\n"
+        f"⚠️ <b>ВАЖНО:</b> При оплате в поле «Коментар» ОБЯЗАТЕЛЬНО укажите ваш ID:\n"
+        f"👉 <code>ID: {user_id}</code> (нажмите, чтобы скопировать)\n\n"
+        "После перевода нажмите кнопку <b>«🔄 Проверить оплату»</b> ниже 👇"
+    )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"↗️ Перейти в Банку ({plan['uah']} грн)", url=jar_payment_link)],
+        [InlineKeyboardButton(text="🔄 Проверить оплату", callback_data=f"check_mono:{plan_key}")],
+        [InlineKeyboardButton(text="📩 Я оплатил (Отправить чек админу)", callback_data=f"notify_admin_mono:{plan_key}")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="show_plans")]
+    ])
+    
     try:
-        await callback.answer()
-        plan_key = callback.data.split(":")[1]
-        plan = PLANS.get(plan_key)
-        if not plan:
-            return
-
-        user_id = callback.from_user.id
-        # Чистый и валидный для Telegram URL с предзаполненной суммой
-        jar_payment_link = f"{MONOBANK_JAR_URL}?a={plan['uah']}"
-
-        text = (
-            f"💳 <b>Оплата через Monobank Банку:</b>\n\n"
-            f"Тариф: <b>{html.escape(plan['title'])}</b>\n"
-            f"Сумма к оплате: <b>{plan['uah']} грн</b>\n\n"
-            f"⚠️ <b>ВАЖНО:</b> При оплате в поле «Коментар» ОБЯЗАТЕЛЬНО укажите ваш ID:\n"
-            f"👉 <code>ID: {user_id}</code> (нажмите, чтобы скопировать)\n\n"
-            "После перевода нажмите кнопку <b>«🔄 Проверить оплату»</b> ниже 👇"
-        )
-
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=f"↗️ Перейти в Банку ({plan['uah']} грн)", url=jar_payment_link)],
-            [InlineKeyboardButton(text="🔄 Проверить оплату", callback_data=f"check_mono:{plan_key}")],
-            [InlineKeyboardButton(text="📩 Я оплатил (Отправить чек админу)", callback_data=f"notify_admin_mono:{plan_key}")],
-            [InlineKeyboardButton(text="◀️ Назад к тарифам", callback_data="show_plans")]
-        ])
         await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
-    except Exception as exc:
-        logger.error(f"Ошибка в cb_pay_mono: {exc}", exc_info=True)
-        # Если Telegram не смог отредактировать сообщение, отправляем новое с кнопкой-ссылкой
-        try:
-            fallback_kb = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text=f"↗️ Перейти в Банку ({plan['uah']} грн)", url=f"{DEFAULT_MONO_JAR}?a={plan['uah']}")],
-                [InlineKeyboardButton(text="📩 Я оплатил (Отправить чек)", callback_data=f"notify_admin_mono:{plan_key}")]
-            ])
-            await callback.message.answer(
-                f"💳 <b>Ссылка для оплаты {html.escape(plan['title'])}:</b>\n\n"
-                f"Сумма: <b>{plan['uah']} грн</b>\n"
-                f"В комментарии укажите: <code>ID: {callback.from_user.id}</code>",
-                parse_mode="HTML",
-                reply_markup=fallback_kb
-            )
-        except Exception:
-            pass
+    except Exception as e:
+        logger.warning(f"edit_text error in pay_mono, fallback to answer: {e}")
+        await callback.message.answer(text, parse_mode="HTML", reply_markup=kb)
 
 @dp.callback_query(F.data.startswith("check_mono:"))
 async def cb_check_monobank_statement(callback: CallbackQuery):
-    """Строгая автоматическая проверка выписки: точная сумма + защита от повторного чека."""
     await callback.answer("Проверяю поступления на Банку...", show_alert=False)
     plan_key = callback.data.split(":")[1]
     plan = PLANS.get(plan_key)
@@ -608,7 +599,7 @@ async def cb_check_monobank_statement(callback: CallbackQuery):
 
     if not MONOBANK_TOKEN:
         await callback.message.answer(
-            "⚠️ Авто-проверка через API не подключена (в настройках Render не указан MONOBANK_TOKEN).\n\n"
+            "⚠️ Авто-проверка через API не подключена.\n\n"
             "Нажмите кнопку <b>«📩 Я оплатил (Отправить чек админу)»</b>, чтобы администратор активировал доступ вручную!",
             parse_mode="HTML"
         )
@@ -617,7 +608,7 @@ async def cb_check_monobank_statement(callback: CallbackQuery):
     try:
         headers = {"X-Token": MONOBANK_TOKEN}
         now_ts = int(datetime.now().timestamp())
-        from_ts = now_ts - 7200  # последние 2 часа
+        from_ts = now_ts - 7200
 
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get("https://api.monobank.ua/personal/client-info", headers=headers)
@@ -665,7 +656,6 @@ async def cb_check_monobank_statement(callback: CallbackQuery):
                         comment = str(tx.get("comment", "")) + " " + str(tx.get("description", ""))
                         amount = tx.get("amount", 0)
 
-                        # Строгая проверка: сумма в копейках должна быть НЕ МЕНЬШЕ стоимости тарифа
                         if str(user_id) in comment and amount >= expected_kopecks:
                             found_tx = tx
                             cursor.execute(
@@ -694,7 +684,7 @@ async def cb_check_monobank_statement(callback: CallbackQuery):
             )
     except Exception as e:
         logger.error(f"Ошибка проверки Монобанка: {e}")
-        await callback.message.answer("⚠️ Ошибка соединения с Monobank. Нажмите кнопку «📩 Я оплатил», чтобы передать чек админу.")
+        await callback.message.answer("⚠️ Ошибка соединения с Monobank. Нажмите кнопку «📩 Я оплатил».")
 
 @dp.callback_query(F.data.startswith("notify_admin_mono:"))
 async def cb_notify_admin_mono(callback: CallbackQuery):
@@ -818,7 +808,7 @@ async def process_neck_tag_photo(message: Message, state: FSMContext):
 async def process_care_tag_photo(message: Message, state: FSMContext):
     user_data = await state.get_data()
     await state.clear()
-    status_msg = await message.answer("⏳ Анализирую бирки, швы и артикулы через Gemini AI... Это займет 3–5 секунд.")
+    status_msg = await message.answer("⏳ Распознаю артикул Inditex/Zara и сверяю базу цен... 4–6 секунд.")
 
     try:
         image_parts = await asyncio.gather(
@@ -832,7 +822,7 @@ async def process_care_tag_photo(message: Message, state: FSMContext):
         u = get_user_data(message.from_user.id)
 
         brand = html.escape(str(data.get("brand", "Не указан")))
-        item_name = html.escape(str(data.get("item_name", "Вещь / Кроссовки")))
+        item_name = html.escape(str(data.get("item_name", "Вещь / Обувь")))
         tier = html.escape(str(data.get("category_tier", "Масс-маркет")))
         era = html.escape(str(data.get("era_or_year", "Неизвестно")))
         verdict = html.escape(str(data.get("authenticity_verdict", "Проверено")))
@@ -854,7 +844,7 @@ async def process_care_tag_photo(message: Message, state: FSMContext):
 
         result_message = (
             f"🏷 <b>Бренд:</b> {brand}\n"
-            f"👟 <b>Модель:</b> {item_name}\n"
+            f"👕 <b>Модель:</b> {item_name}\n"
             f"📦 <b>Сегмент:</b> {tier}\n"
             f"📅 <b>Период:</b> {era}\n\n"
             f"{score_emoji} <b>Легит-чек:</b> {verdict} ({score}%)\n"
@@ -885,11 +875,11 @@ async def process_care_tag_photo(message: Message, state: FSMContext):
         await message.answer(result_message, parse_mode="HTML", reply_markup=kb)
 
     except (json.JSONDecodeError, ValueError) as json_err:
-        logger.warning(f"Ошибка чтения данных нейросети: {json_err}")
+        logger.warning(f"Ошибка парсинга JSON: {json_err}")
         try:
             await status_msg.edit_text(
-                "🔍 <b>Не удалось чётко распознать артикул или бирки.</b>\n\n"
-                "Пожалуйста, сделайте более чёткое фото внутренней бирки/язычка при хорошем освещении и повторите попытку через главное меню.",
+                "🔍 <b>Не удалось чётко прочесть бирку.</b>\n\n"
+                "Сделайте фото сервисного ярлыка ближе и в фокусе, чтобы цифры артикула были различимы.",
                 parse_mode="HTML"
             )
         except Exception:
