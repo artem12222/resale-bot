@@ -5,6 +5,7 @@ import io
 import json
 import logging
 import os
+import re
 import sqlite3
 from typing import Optional
 import urllib.parse
@@ -34,13 +35,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ======================== НАСТРОЙКИ И КЛЮЧИ (ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ) ========================
+# ======================== НАСТРОЙКИ И КЛЮЧИ ========================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-ADMIN_USER_ID = 5641374843
+ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "5641374843"))
 
-# Ссылка на банку и токен Монобанка
 MONOBANK_JAR_URL = os.getenv("MONOBANK_JAR_URL", "https://send.monobank.ua/jar/7E9CVK1jX1").strip().strip('"').strip("'")
 MONOBANK_TOKEN = os.getenv("MONOBANK_TOKEN", "").strip()
 
@@ -90,12 +90,14 @@ PLANS = {
     }
 }
 
-# Только стабильные и быстрые модели Google Gemini
+# Только актуальные модели с быстрой отдачей
 CANDIDATE_MODELS = [
-    "gemini-3.6-flash",
     "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-3.6-flash"
 ]
 
+# ======================== БАЗА ДАННЫХ С ЗАЩИТОЙ ТРАНЗАКЦИЙ ========================
 def init_db():
     with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
@@ -129,6 +131,16 @@ def init_db():
                 currency TEXT,
                 method TEXT,
                 status TEXT,
+                created_at TEXT
+            )
+        """)
+
+        # Таблица для защиты от повторного использования чека и махинаций с 1 грн
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS processed_transactions (
+                tx_id TEXT PRIMARY KEY,
+                user_id INTEGER,
+                amount_kopecks INTEGER,
                 created_at TEXT
             )
         """)
@@ -273,51 +285,46 @@ except Exception as err:
     ai_client = None
 
 ANALYSIS_PROMPT = """
-Ты — профессиональный эксперт по ресейлу, оценке одежды и легит-чеку.
-Тебе отправлены 3 фотографии одной вещи:
-1) Общий вид одежды.
-2) Горловина / воротник / нашивка бренда.
-3) Внутренняя сервисная бирка (wash/care tag) с артикулом, составом и кодами.
+Ты — профессиональный эксперт по ресейлу, оценке одежды, обуви (кроссовок) и легит-чеку.
+Тебе отправлены 3 фотографии одной вещи или пары обуви:
+1) Общий вид (одежда целиком или пара кроссовок).
+2) Главная бирка: горловина/воротник (для одежды) ИЛИ бирка на язычке/логотип (для обуви/кроссовок).
+3) Сервисная бирка: wash tag с составом и артикулом (для одежды) ИЛИ размерная бирка со style-code/штрихкодом внутри обуви.
 
-ВАЖНЫЕ ПРАВИЛА РАСПОЗНАВАНИЯ И ОЦЕНКИ:
-1. КОРРЕКТНЫЙ OCR И ЛИНЕЙКИ:
-   - Если бренд Pull & Bear и на принте/бирке надпись STWD — это линейка STWD (Stay White Dope), а НЕ "STAX".
-   - Если Zara — различай линейки: Man, Woman, TRF (Trafaluc), Basic, Origins, Studio.
-   - Считывай точный артикул (Ref / Art number) с нижней бирки, если он виден.
+ВАЖНЫЕ ПРАВИЛА РАСПОЗНАВАНИЯ:
+1. КРОССОВКИ И ОБУВЬ:
+   - Считывай Style-Code / SKU артикул (например: Nike DD1391-100, adidas GW1229, New Balance BB550).
+   - Оценивай шрифты, даты производства, ровность строчки и бирку на язычке.
+2. ОДЕЖДА И БИРКИ:
+   - Если Pull & Bear и надпись STWD — это линейка STWD (Stay White Dope).
+   - Различай линейки Zara (Man, Woman, TRF, Origins).
+3. СЕГМЕНТ И РЕАЛЬНЫЕ РЫНОЧНЫЕ ЦЕНЫ (ВТОРИЧКА УКРАИНЫ И СНГ):
+   - "Масс-маркет" (Pull&Bear, Zara, Bershka, H&M): 99-100% оригинал. Цены: футболки 100–250 грн, худи/свитшоты 250–500 грн, куртки 400–900 грн.
+   - "Ворквир / Стритвир / Кроссовки" (Carhartt, Stussy, Nike, Jordan, adidas, New Balance): оценивай по проданным парам на eBay Sold и OLX/Shafa.
+   - "Премиум / Люкс" (Stone Island, CP Company, Ralph Lauren, Arc'teryx): строгий легит-чек.
 
-2. СЕГМЕНТ И РЕАЛЬНЫЕ РЫНОЧНЫЕ ЦЕНЫ (ВТОРИЧКА УКРАИНЫ И СНГ):
-   - "Масс-маркет" (Pull & Bear, Zara, Bershka, H&M, Reserved, Cropp, House):
-     * Оригинальность: 99-100% оригинал (масс-маркет не подделывают).
-     * Футболки/майки б/у: 100 – 250 грн ($2.5 – $6 USD).
-     * Рубашки/худи/свитшоты б/у: 250 – 500 грн ($6 – $12 USD).
-     * Жилетки/куртки б/у: 400 – 900 грн ($10 – $22 USD).
-   - "Винтаж / Ворквир / Стритвир" (Carhartt, Stussy, The North Face, Nike Vintage, Dickies, Levi's):
-     * Оценивай по реальным ценам проданных лотов на eBay Sold и Grailed.
-   - "Премиум / Люкс" (Stone Island, CP Company, Ralph Lauren, Arc'teryx, Prada):
-     * Высокий риск подделок, строгая проверка патчей, Certilogo, штрихкодов и швов.
+4. ПОИСКОВЫЕ ЗАПРОСЫ (МАКСИМУМ 2-3 СЛОВА):
+   - search_query_local (OLX / Шафа): бренд + модель (например: "Nike Dunk Low", "Pull and Bear футболка").
+   - search_query_global (eBay / Grailed): бренд + модель + артикул (например: "Nike Dunk DD1391-100").
 
-3. ЛАКОНИЧНЫЕ ПОИСКОВЫЕ ЗАПРОСЫ (МАКСИМУМ 2-3 СЛОВА):
-   - search_query_local (для OLX и Шафы): бренд + тип вещи (например: "Pull and Bear футболка", "Zara жилетка").
-   - search_query_global (for eBay/Grailed): бренд + модель латиницей (например: "Pull and Bear STWD tee").
-
-Верни СТРОГИЙ JSON без оформления markdown:
+ОБЯЗАТЕЛЬНО верни валидный JSON без лишнего вступительного текста:
 {
   "brand": "Точное название бренда",
-  "category_tier": "Масс-маркет / Стритвир и Ворквир / Премиум и Люкс",
+  "category_tier": "Масс-маркет / Стритвир и Обувь / Премиум и Люкс",
   "item_name": "Название модели или линейки",
   "era_or_year": "Примерные годы выпуска",
   "authenticity_verdict": "100% Оригинал / Оригинал / Фейк / Сомнительно",
   "authenticity_score": 95,
   "legit_reasons": [
-    "Оригинальная фирменная бирка",
-    "Швы и сервисный ярлык соответствуют стандартам"
+    "Оригинальные бирки и фабричные шрифты",
+    "Швы и артикул соответствуют стандартам бренда"
   ],
   "price_uah_min": 150,
   "price_uah_max": 250,
   "price_usd_min": 4,
   "price_usd_max": 7,
-  "search_query_local": "Pull and Bear футболка",
-  "search_query_global": "Pull and Bear STWD tee"
+  "search_query_local": "Nike Dunk Low",
+  "search_query_global": "Nike Dunk DD1391-100"
 }
 """
 
@@ -333,25 +340,32 @@ def generate_marketplace_links(query_local: str, query_global: str) -> dict[str,
     }
 
 def prepare_image_part_sync(file_bytes: bytes) -> genai_types.Part:
-    """Быстрое сжатие фото с минимальной нагрузкой на CPU."""
+    """Ультра-быстрое сжатие до 800px: процессор Render не напрягается."""
     with Image.open(io.BytesIO(file_bytes)) as img:
         img = img.convert("RGB")
-        img.thumbnail((1024, 1024), Image.Resampling.BILINEAR)
+        img.thumbnail((800, 800), Image.Resampling.BILINEAR)
         out_buf = io.BytesIO()
-        img.save(out_buf, format="JPEG", quality=75, optimize=False)
+        img.save(out_buf, format="JPEG", quality=70, optimize=False)
         return genai_types.Part.from_bytes(data=out_buf.getvalue(), mime_type="image/jpeg")
 
 async def fetch_and_prep_photo(bot_instance: Bot, file_id: str) -> genai_types.Part:
-    """Асинхронная загрузка фото и фоновое сжатие в отдельном потоке."""
     file_info = await bot_instance.get_file(file_id)
     stream = io.BytesIO()
     await bot_instance.download_file(file_info.file_path, destination=stream)
     return await asyncio.to_thread(prepare_image_part_sync, stream.getvalue())
 
+def extract_clean_json(text: str) -> dict:
+    """Извлекает JSON даже если нейросеть добавила лишние слова или кавычки."""
+    cleaned = text.strip()
+    match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+    if match:
+        cleaned = match.group(0)
+    return json.loads(cleaned)
+
 async def analyze_with_gemini_fallback(image_parts: list[genai_types.Part]) -> dict:
     if not ai_client:
-        raise RuntimeError("GEMINI_API_KEY не установлен в окружении.")
-    
+        raise RuntimeError("GEMINI_API_KEY не установлен в переменных окружения.")
+
     last_error = None
     for model_name in CANDIDATE_MODELS:
         for attempt in range(2):
@@ -367,30 +381,25 @@ async def analyze_with_gemini_fallback(image_parts: list[genai_types.Part]) -> d
                             temperature=0.2
                         )
                     ),
-                    timeout=45.0  # Увеличенный тайм-аут для стабильности
+                    timeout=35.0
                 )
                 if response and response.text:
-                    raw = response.text.strip()
-                    if raw.startswith("```"):
-                        raw = raw.strip("`")
-                        if raw.startswith("json"):
-                            raw = raw[4:].strip()
-                    return json.loads(raw)
+                    return extract_clean_json(response.text)
             except Exception as exc:
                 err_msg = str(exc)
-                logger.warning(f"Ошибка модели {model_name}: {err_msg}")
+                logger.warning(f"Сбой модели {model_name}: {err_msg}")
                 last_error = exc
                 if "404" in err_msg or "NOT_FOUND" in err_msg:
                     break
-                await asyncio.sleep(1.5)
-    raise last_error or RuntimeError("Все AI-модели временно недоступны.")
+                await asyncio.sleep(1.0)
+    raise last_error or RuntimeError("Нейросеть временно недоступна.")
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else None
 dp = Dispatcher(storage=MemoryStorage())
 
 def get_main_menu_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔍 Проверить вещь (3 фото)", callback_data="start_check")],
+        [InlineKeyboardButton(text="🔍 Проверить вещь / обувь (3 фото)", callback_data="start_check")],
         [
             InlineKeyboardButton(text="💎 Тарифы и Безлимит", callback_data="show_plans"),
             InlineKeyboardButton(text="👤 Мой профиль", callback_data="show_profile")
@@ -413,11 +422,11 @@ async def cmd_start(message: Message, state: FSMContext):
     welcome_text = (
         f"👋 Привет, <b>{name}</b>!\n\n"
         "Я — <b>Resale & Legit Checker Bot</b>.\n"
-        "Помогу оценить шмотку перед покупкой или продажей:\n"
-        "• Распознаю бренд, модель и год выпуска\n"
-        "• Проведу легит-чек по биркам и фурнитуре\n"
-        "• Покажу реальную цену в Украине и проданные лоты на eBay\n"
-        "• Сгенерирую готовые ссылки на Shafa.ua, OLX, eBay, Grailed\n\n"
+        "Помогу быстро оценить одежду или кроссовки:\n"
+        "• Распознаю бренд, точный артикул и линейку\n"
+        "• Проведу легит-чек по биркам и штрихкодам\n"
+        "• Покажу реальную цену в Украине и проданные пары на eBay\n"
+        "• Сгенерирую готовые поисковые ссылки на Shafa.ua, OLX, eBay, Grailed\n\n"
         f"📊 Твой статус: <b>{html.escape(u['status_text'])}</b>."
     )
     await message.answer(welcome_text, parse_mode="HTML", reply_markup=get_main_menu_keyboard())
@@ -532,7 +541,7 @@ async def process_successful_stars_payment(message: Message):
             "Приятного пользования! Нажмите кнопку ниже, чтобы проверить вещь 👇"
         )
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔍 Проверить вещь", callback_data="start_check")]
+            [InlineKeyboardButton(text="🔍 Проверить вещь / обувь", callback_data="start_check")]
         ])
         await message.answer(congrats_text, parse_mode="HTML", reply_markup=kb)
 
@@ -545,7 +554,7 @@ async def cb_pay_mono(callback: CallbackQuery):
         return
 
     user_id = callback.from_user.id
-    jar_payment_link = f"{MONOBANK_JAR_URL}?a={plan['uah']}"
+    jar_payment_link = f"{MONOBANK_JAR_URL}?a={plan['uah']}&t=ID_{user_id}"
 
     text = (
         f"💳 <b>Оплата через Monobank Банку:</b>\n\n"
@@ -566,7 +575,7 @@ async def cb_pay_mono(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("check_mono:"))
 async def cb_check_monobank_statement(callback: CallbackQuery):
-    """Автоматическая проверка выписки Банки через официальный Monobank API."""
+    """Строгая автоматическая проверка выписки: точная сумма + защита от повторного чека."""
     await callback.answer("Проверяю поступления на Банку...", show_alert=False)
     plan_key = callback.data.split(":")[1]
     plan = PLANS.get(plan_key)
@@ -574,8 +583,8 @@ async def cb_check_monobank_statement(callback: CallbackQuery):
 
     if not MONOBANK_TOKEN:
         await callback.message.answer(
-            "⚠️ Авто-проверка через API не подключена (в настройках сервера не указан MONOBANK_TOKEN).\n\n"
-            "Нажмите кнопку <b>«📩 Я оплатил (Отправить чек админу)»</b>, и администратор подтвердит платеж вручную!",
+            "⚠️ Авто-проверка через API не подключена (в настройках Render не указан MONOBANK_TOKEN).\n\n"
+            "Нажмите кнопку <b>«📩 Я оплатил (Отправить чек админу)»</b>, чтобы администратор активировал доступ вручную!",
             parse_mode="HTML"
         )
         return
@@ -583,22 +592,19 @@ async def cb_check_monobank_statement(callback: CallbackQuery):
     try:
         headers = {"X-Token": MONOBANK_TOKEN}
         now_ts = int(datetime.now().timestamp())
-        from_ts = now_ts - 7200  # проверяем платежи за последние 2 часа
+        from_ts = now_ts - 7200  # последние 2 часа
 
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get("https://api.monobank.ua/personal/client-info", headers=headers)
             if resp.status_code == 429:
                 await callback.message.answer(
-                    "⏳ Monobank разрешает опрашивать выписку не чаще 1 раза в минуту.\nПожалуйста, подождите минуту и нажмите ещё раз.",
+                    "⏳ Monobank разрешает опрашивать выписку не чаще 1 раза в минуту.\nПожалуйста, подождите 60 секунд.",
                     parse_mode="HTML"
                 )
                 return
 
             if resp.status_code != 200:
-                await callback.message.answer(
-                    "⚠️ Банк временно не отвечает. Нажмите кнопку <b>«📩 Я оплатил (Отправить чек админу)»</b>.",
-                    parse_mode="HTML"
-                )
+                await callback.message.answer("⚠️ Банк временно не отвечает. Нажмите «📩 Я оплатил».")
                 return
 
             client_info = resp.json()
@@ -618,21 +624,37 @@ async def cb_check_monobank_statement(callback: CallbackQuery):
 
             if stmt_resp.status_code == 200:
                 transactions = stmt_resp.json()
-                found = False
+                found_tx = None
                 expected_kopecks = int(plan["uah"] * 100)
 
-                for tx in transactions:
-                    comment = str(tx.get("comment", "")) + " " + str(tx.get("description", ""))
-                    amount = tx.get("amount", 0)
-                    if str(user_id) in comment and amount >= expected_kopecks:
-                        found = True
-                        break
+                with sqlite3.connect(DB_NAME) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT tx_id FROM processed_transactions")
+                    used_tx_ids = set(row[0] for row in cursor.fetchall())
 
-                if found:
+                    for tx in transactions:
+                        tx_id = str(tx.get("id", ""))
+                        if tx_id in used_tx_ids:
+                            continue
+
+                        comment = str(tx.get("comment", "")) + " " + str(tx.get("description", ""))
+                        amount = tx.get("amount", 0)
+
+                        # Строгая проверка: сумма в копейках должна быть НЕ МЕНЬШЕ стоимости тарифа
+                        if str(user_id) in comment and amount >= expected_kopecks:
+                            found_tx = tx
+                            cursor.execute(
+                                "INSERT INTO processed_transactions (tx_id, user_id, amount_kopecks, created_at) VALUES (?, ?, ?, ?)",
+                                (tx_id, user_id, amount, datetime.now().isoformat())
+                            )
+                            conn.commit()
+                            break
+
+                if found_tx:
                     activate_plan(user_id, plan_key, "monobank_auto", plan["uah"], "UAH")
                     u = get_user_data(user_id)
                     await callback.message.answer(
-                        f"🎉 <b>Оплата успешно найдена и подтверждена!</b>\n\n"
+                        f"🎉 <b>Оплата найдена и подтверждена!</b>\n\n"
                         f"Тариф <b>{html.escape(plan['title'])}</b> активирован.\n"
                         f"📊 Ваш новый баланс: <b>{html.escape(u['status_text'])}</b>",
                         parse_mode="HTML",
@@ -641,8 +663,8 @@ async def cb_check_monobank_statement(callback: CallbackQuery):
                     return
 
             await callback.message.answer(
-                "⏳ Платёж пока не найден в выписке Банки или вы забыли указать ваш ID в комментарии перевода.\n\n"
-                "Если деньги уже списались с карты, нажмите <b>«📩 Я оплатил (Отправить чек админу)»</b>.",
+                f"⏳ Платёж на сумму <b>{plan['uah']} грн</b> с вашим ID в комментарии пока не поступил в выписку.\n\n"
+                "Если деньги уже списались с карты, нажмите кнопку <b>«📩 Я оплатил (Отправить чек админу)»</b>.",
                 parse_mode="HTML"
             )
     except Exception as e:
@@ -659,7 +681,7 @@ async def cb_notify_admin_mono(callback: CallbackQuery):
 
     admin_kb = InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="✅ Подтвердить оплату", callback_data=f"adm_approve:{user_id}:{plan_key}"),
+            InlineKeyboardButton(text=f"✅ Подтвердить {plan['uah']} грн", callback_data=f"adm_approve:{user_id}:{plan_key}"),
             InlineKeyboardButton(text="❌ Отклонить", callback_data=f"adm_reject:{user_id}")
         ]
     ])
@@ -668,8 +690,8 @@ async def cb_notify_admin_mono(callback: CallbackQuery):
         f"🔔 <b>Новая заявка на оплату Монобанки!</b>\n\n"
         f"Пользователь: {html.escape(user_tag)} (<code>{user_id}</code>)\n"
         f"Тариф: <b>{html.escape(plan['title'])}</b>\n"
-        f"Сумма к зачислению: <b>{plan['uah']} грн</b>\n\n"
-        "Проверьте выписку в приложении Монобанка и подтвердите зачисление:"
+        f"⚠️ <b>Требуемая сумма: {plan['uah']} грн</b> (НЕ подтверждайте, если пришла 1 грн!)\n\n"
+        "Проверьте выписку в приложении Monobank:"
     )
 
     try:
@@ -703,13 +725,13 @@ async def cb_admin_approve(callback: CallbackQuery):
                 f"🎉 <b>Ваша оплата подтверждена!</b>\n\n"
                 f"Тариф: <b>{html.escape(plan['title'])}</b> успешно начислен.\n"
                 f"📊 Ваш статус: <b>{html.escape(u['status_text'])}</b>.\n\n"
-                "Приятных проверок вещей!",
+                "Приятных проверок вещей и кроссовок!",
                 parse_mode="HTML",
                 reply_markup=get_main_menu_keyboard()
             )
         except Exception:
             pass
-        await callback.message.edit_text(f"✅ Успешно! Пользователю <code>{target_user_id}</code> выдан тариф {plan['title']}.", parse_mode="HTML")
+        await callback.message.edit_text(f"✅ Успешно! Пользователю <code>{target_user_id}</code> выдан тариф {plan['title']} ({plan['uah']} грн).", parse_mode="HTML")
 
 @dp.callback_query(F.data.startswith("adm_reject:"))
 async def cb_admin_reject(callback: CallbackQuery):
@@ -718,7 +740,7 @@ async def cb_admin_reject(callback: CallbackQuery):
         return
     target_user_id = int(callback.data.split(":")[1])
     try:
-        await bot.send_message(target_user_id, "❌ Платеж не был обнаружен в выписке Банки.", parse_mode="HTML")
+        await bot.send_message(target_user_id, "❌ Платеж на указанную сумму не был найден в выписке Банки.", parse_mode="HTML")
     except Exception:
         pass
     await callback.message.edit_text(f"❌ Заявка пользователя <code>{target_user_id}</code> отклонена.", parse_mode="HTML")
@@ -743,7 +765,7 @@ async def cb_start_check(callback: CallbackQuery, state: FSMContext):
     await state.set_state(ClothingCheckFSM.waiting_for_main_photo)
     await callback.message.answer(
         "📸 <b>Шаг 1 из 3:</b>\n"
-        "Пришлите фотографию <b>вещи целиком</b> (общий план спереди или сзади).",
+        "Пришлите фотографию <b>вещи или обуви целиком</b> (общий план).",
         parse_mode="HTML"
     )
 
@@ -753,7 +775,7 @@ async def process_main_photo(message: Message, state: FSMContext):
     await state.set_state(ClothingCheckFSM.waiting_for_neck_tag)
     await message.answer(
         "🏷 <b>Шаг 2 из 3:</b>\n"
-        "Отлично! Теперь сфотографируйте <b>бирку на воротнике / горловине</b> крупным планом при хорошем освещении.",
+        "Отлично! Теперь сфотографируйте <b>бирку на воротнике/горловине</b> (для одежды) или <b>бирку на язычке / внешний логотип</b> (для кроссовок).",
         parse_mode="HTML"
     )
 
@@ -763,7 +785,7 @@ async def process_neck_tag_photo(message: Message, state: FSMContext):
     await state.set_state(ClothingCheckFSM.waiting_for_care_tag)
     await message.answer(
         "🧵 <b>Шаг 3 из 3:</b>\n"
-        "Последний шаг: отправьте <b>нижнюю сервисную бирку</b> (где указаны состав, артикул, RN-код, стирка).",
+        "Последний шаг: отправьте <b>нижнюю сервисную бирку</b> (с артикулом и составом) или <b>внутреннюю размерную бирку кроссовок</b> со style-code.",
         parse_mode="HTML"
     )
 
@@ -771,10 +793,9 @@ async def process_neck_tag_photo(message: Message, state: FSMContext):
 async def process_care_tag_photo(message: Message, state: FSMContext):
     user_data = await state.get_data()
     await state.clear()
-    status_msg = await message.answer("⏳ Анализирую бирки, швы и артикулы через Gemini AI... Это займет 3–6 секунд.")
+    status_msg = await message.answer("⏳ Анализирую бирки, швы и артикулы через Gemini AI... Это займет 3–5 секунд.")
 
     try:
-        # Параллельная загрузка и оптимизация всех 3 фото
         image_parts = await asyncio.gather(
             fetch_and_prep_photo(bot, user_data["main_photo"]),
             fetch_and_prep_photo(bot, user_data["neck_photo"]),
@@ -786,7 +807,7 @@ async def process_care_tag_photo(message: Message, state: FSMContext):
         u = get_user_data(message.from_user.id)
 
         brand = html.escape(str(data.get("brand", "Не указан")))
-        item_name = html.escape(str(data.get("item_name", "Вещь")))
+        item_name = html.escape(str(data.get("item_name", "Вещь / Кроссовки")))
         tier = html.escape(str(data.get("category_tier", "Масс-маркет")))
         era = html.escape(str(data.get("era_or_year", "Неизвестно")))
         verdict = html.escape(str(data.get("authenticity_verdict", "Проверено")))
@@ -796,7 +817,7 @@ async def process_care_tag_photo(message: Message, state: FSMContext):
         links = generate_marketplace_links(local_q, global_q)
 
         reasons_list = data.get("legit_reasons", [])
-        reasons_formatted = "\n".join([f"  • {html.escape(str(r))}" for r in reasons_list]) if reasons_list else "  • Детали соответствуют стандартам бренда"
+        reasons_formatted = "\n".join([f"  • {html.escape(str(r))}" for r in reasons_list]) if reasons_list else "  • Детали и бирки соответствуют стандартам бренда"
 
         score = data.get("authenticity_score", 50)
         score_emoji = "🟢" if score >= 75 else ("🟡" if score >= 45 else "🔴")
@@ -808,7 +829,7 @@ async def process_care_tag_photo(message: Message, state: FSMContext):
 
         result_message = (
             f"🏷 <b>Бренд:</b> {brand}\n"
-            f"👕 <b>Модель/Линейка:</b> {item_name}\n"
+            f"👟 <b>Модель:</b> {item_name}\n"
             f"📦 <b>Сегмент:</b> {tier}\n"
             f"📅 <b>Период:</b> {era}\n\n"
             f"{score_emoji} <b>Легит-чек:</b> {verdict} ({score}%)\n"
@@ -838,10 +859,20 @@ async def process_care_tag_photo(message: Message, state: FSMContext):
         await status_msg.delete()
         await message.answer(result_message, parse_mode="HTML", reply_markup=kb)
 
+    except (json.JSONDecodeError, ValueError) as json_err:
+        logger.warning(f"Ошибка чтения данных нейросети: {json_err}")
+        try:
+            await status_msg.edit_text(
+                "🔍 <b>Не удалось чётко распознать артикул или бирки.</b>\n\n"
+                "Пожалуйста, сделайте более чёткое фото внутренней бирки/язычка при хорошем освещении и повторите попытку через главное меню.",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
     except Exception as exc:
         logger.error(f"Ошибка при обработке запроса: {exc}", exc_info=True)
         try:
-            await status_msg.edit_text("❌ Сервера временно перегружены. Повторите попытку через минуту.")
+            await status_msg.edit_text("❌ Сервера Gemini кратковременно перегружены. Повторите попытку через минуту.")
         except Exception:
             pass
 
