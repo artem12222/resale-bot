@@ -35,16 +35,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ======================== НАСТРОЙКИ И КЛЮЧИ (ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ) ========================
-# Токен телеграм бота и ключ Gemini считываются из защищенных Environment Variables на Render
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 ADMIN_USER_ID = 5641374843
 
-# Ссылка на твою Банку (без токенов, чистая ссылка для перевода)
-MONOBANK_JAR_URL = "https://send.monobank.ua/jar/7E9CVK1jX1"
-# Токен API Монобанка для автоматической проверки выписок
-MONOBANK_TOKEN = os.getenv("MONOBANK_TOKEN", "")
+# Ссылка на банку и токен Монобанка
+MONOBANK_JAR_URL = os.getenv("MONOBANK_JAR_URL", "https://send.monobank.ua/jar/7E9CVK1jX1").strip().strip('"').strip("'")
+MONOBANK_TOKEN = os.getenv("MONOBANK_TOKEN", "").strip()
 
 FREE_CHECKS_PER_DAY = 3
 DB_NAME = "resale_bot.db"
@@ -92,11 +90,11 @@ PLANS = {
     }
 }
 
+# Только стабильные и быстрые модели Google Gemini
 CANDIDATE_MODELS = [
     "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
-    "gemini-3.6-flash",
-    "gemini-2.5-pro"
+    "gemini-2.0-flash"
 ]
 
 def init_db():
@@ -335,21 +333,31 @@ def generate_marketplace_links(query_local: str, query_global: str) -> dict[str,
         "grailed": f"https://www.grailed.com/shop?query={enc_global}"
     }
 
-def prepare_image_part(file_stream: io.BytesIO) -> genai_types.Part:
-    with Image.open(file_stream) as img:
+def prepare_image_part_sync(file_bytes: bytes) -> genai_types.Part:
+    """Быстрое сжатие фото с минимальной нагрузкой на CPU."""
+    with Image.open(io.BytesIO(file_bytes)) as img:
         img = img.convert("RGB")
-        img.thumbnail((1280, 1280), Image.Resampling.LANCZOS)
+        img.thumbnail((1024, 1024), Image.Resampling.BILINEAR)
         out_buf = io.BytesIO()
-        img.save(out_buf, format="JPEG", quality=82, optimize=True)
+        img.save(out_buf, format="JPEG", quality=75, optimize=False)
         return genai_types.Part.from_bytes(data=out_buf.getvalue(), mime_type="image/jpeg")
+
+async def fetch_and_prep_photo(bot_instance: Bot, file_id: str) -> genai_types.Part:
+    """Асинхронная загрузка фото и фоновое сжатие в отдельном потоке."""
+    file_info = await bot_instance.get_file(file_id)
+    stream = io.BytesIO()
+    await bot_instance.download_file(file_info.file_path, destination=stream)
+    return await asyncio.to_thread(prepare_image_part_sync, stream.getvalue())
 
 async def analyze_with_gemini_fallback(image_parts: list[genai_types.Part]) -> dict:
     if not ai_client:
         raise RuntimeError("GEMINI_API_KEY не установлен в окружении.")
+    
     last_error = None
     for model_name in CANDIDATE_MODELS:
         for attempt in range(2):
             try:
+                logger.info(f"Запрос к {model_name} (попытка {attempt + 1})...")
                 response = await asyncio.wait_for(
                     asyncio.to_thread(
                         ai_client.models.generate_content,
@@ -360,7 +368,7 @@ async def analyze_with_gemini_fallback(image_parts: list[genai_types.Part]) -> d
                             temperature=0.2
                         )
                     ),
-                    timeout=20.0
+                    timeout=45.0  # Увеличенный тайм-аут для стабильности
                 )
                 if response and response.text:
                     raw = response.text.strip()
@@ -371,10 +379,11 @@ async def analyze_with_gemini_fallback(image_parts: list[genai_types.Part]) -> d
                     return json.loads(raw)
             except Exception as exc:
                 err_msg = str(exc)
+                logger.warning(f"Ошибка модели {model_name}: {err_msg}")
                 last_error = exc
                 if "404" in err_msg or "NOT_FOUND" in err_msg:
                     break
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(1.5)
     raise last_error or RuntimeError("Все AI-модели временно недоступны.")
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else None
@@ -766,13 +775,12 @@ async def process_care_tag_photo(message: Message, state: FSMContext):
     status_msg = await message.answer("⏳ Анализирую бирки, швы и артикулы через Gemini AI... Это займет 3–6 секунд.")
 
     try:
-        image_parts = []
-        for pid in [user_data["main_photo"], user_data["neck_photo"], message.photo[-1].file_id]:
-            file_info = await bot.get_file(pid)
-            file_stream = io.BytesIO()
-            await bot.download_file(file_info.file_path, destination=file_stream)
-            file_stream.seek(0)
-            image_parts.append(prepare_image_part(file_stream))
+        # Параллельная загрузка и оптимизация всех 3 фото
+        image_parts = await asyncio.gather(
+            fetch_and_prep_photo(bot, user_data["main_photo"]),
+            fetch_and_prep_photo(bot, user_data["neck_photo"]),
+            fetch_and_prep_photo(bot, message.photo[-1].file_id)
+        )
 
         data = await analyze_with_gemini_fallback(image_parts)
         decrement_check(message.from_user.id)
