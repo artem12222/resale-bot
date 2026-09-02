@@ -93,12 +93,45 @@ PLANS = {
     }
 }
 
-# Приоритет проверенных актуальных моделей Gemini
-CANDIDATE_MODELS = [
-    "gemini-3.6-flash",
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite"
-]
+try:
+    ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+except Exception as err:
+    logger.error(f"Ошибка настройки Gemini API: {err}")
+    ai_client = None
+
+CACHED_MODELS: list[str] = []
+
+def get_candidate_models() -> list[str]:
+    """Автоматически запрашивает у Google список поддерживаемых моделей для текущего API ключа."""
+    global CACHED_MODELS
+    if CACHED_MODELS:
+        return CACHED_MODELS
+
+    discovered = []
+    if ai_client:
+        try:
+            for m in ai_client.models.list():
+                name = m.name.replace("models/", "")
+                actions = getattr(m, "supported_actions", []) or getattr(m, "supported_generation_methods", [])
+                if actions and "generateContent" not in actions:
+                    continue
+                if "flash" in name and "image" not in name and "live" not in name and "tts" not in name:
+                    discovered.append(name)
+            logger.info(f"Обнаружены доступные модели Google AI: {discovered}")
+        except Exception as e:
+            logger.warning(f"Не удалось получить список моделей через API: {e}")
+
+    preferred = ["gemini-2.5-flash", "gemini-3.7-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-2.5-flash-lite"]
+    result = [m for m in preferred if m in discovered]
+    for d in discovered:
+        if d not in result:
+            result.append(d)
+    if not result:
+        result = preferred
+
+    CACHED_MODELS = result
+    logger.info(f"Итоговый порядок моделей для проверок: {CACHED_MODELS}")
+    return CACHED_MODELS
 
 def init_db():
     with sqlite3.connect(DB_NAME) as conn:
@@ -279,13 +312,6 @@ class ClothingCheckFSM(StatesGroup):
     waiting_for_neck_tag = State()
     waiting_for_care_tag = State()
 
-try:
-    ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
-except Exception as err:
-    logger.error(f"Ошибка настройки Gemini API: {err}")
-    ai_client = None
-
-# Полностью универсальный промпт для ЛЮБОЙ одежды, обуви и аксессуаров любых брендов
 ANALYSIS_PROMPT = """
 Ты — профессиональный эксперт по ресейлу, оценке и легит-чеку ЛЮБОЙ одежды, обуви (кроссовок) и аксессуаров.
 Тебе отправлены 3 фотографии одной вещи:
@@ -313,9 +339,9 @@ ANALYSIS_PROMPT = """
    - search_query_local: бренд + тип вещи на русском/украинском (например: "Nike кроссовки мужские", "Carhartt куртка").
    - search_query_global: бренд + линейка/модель латиницей (например: "Nike Dunk Low", "Carhartt Detroit jacket").
 
-КРИТИЧЕСКИЕ ТРЕБОВАНИЯ К ФОРМАТУ ОТВЕТА:
+КРИТИЧЕСКИЕ ТРЕБОВАНИЯ:
 - Верни ИСКЛЮЧИТЕЛЬНО валидный JSON без оберток markdown (без ```json).
-- Внутри строковых значений НЕ используй двойные кавычки (заменяй их на одинарные ').
+- Внутри строковых значений НЕ используй двойные кавычки.
 
 Структура JSON:
 {
@@ -352,8 +378,7 @@ def generate_marketplace_links(query_local: str, query_global: str) -> dict[str,
 def prepare_image_part_sync(file_bytes: bytes) -> genai_types.Part:
     with Image.open(io.BytesIO(file_bytes)) as img:
         img = img.convert("RGB")
-        # 1024px сохраняет четкость любого мелкого шрифта и артикула
-        img.thumbnail((1024, 1024), Image.Resampling.BILINEAR)
+        img.thumbnail((900, 900), Image.Resampling.BILINEAR)
         out_buf = io.BytesIO()
         img.save(out_buf, format="JPEG", quality=75, optimize=False)
         return genai_types.Part.from_bytes(data=out_buf.getvalue(), mime_type="image/jpeg")
@@ -381,9 +406,7 @@ def extract_clean_json(text: str) -> dict:
         pass
 
     try:
-        # Устраняем случайные запятые перед закрывающими скобками
         fixed = re.sub(r",\s*([}\]])", r"\1", cleaned)
-        # Устраняем внутренние некорректные кавычки
         fixed = re.sub(r'(:\s*")([^"]*)"([^"]*)(")', r'\1\2\'\3\4', fixed)
         return json.loads(fixed)
     except Exception:
@@ -394,10 +417,12 @@ async def analyze_with_gemini_fallback(image_parts: list[genai_types.Part]) -> d
     if not ai_client:
         raise RuntimeError("Ключ GEMINI_API_KEY не установлен в настройках.")
 
+    models_to_try = await asyncio.to_thread(get_candidate_models)
     last_error = None
-    for model_name in CANDIDATE_MODELS:
+
+    for model_name in models_to_try[:3]:
         try:
-            logger.info(f"Запрос к модели {model_name}...")
+            logger.info(f"Отправка запроса к модели {model_name}...")
             response = await asyncio.wait_for(
                 asyncio.to_thread(
                     ai_client.models.generate_content,
@@ -408,7 +433,7 @@ async def analyze_with_gemini_fallback(image_parts: list[genai_types.Part]) -> d
                         temperature=0.1
                     )
                 ),
-                timeout=55.0
+                timeout=45.0
             )
 
             raw_text = None
@@ -426,14 +451,15 @@ async def analyze_with_gemini_fallback(image_parts: list[genai_types.Part]) -> d
                 last_error = RuntimeError(f"Модель {model_name} вернула пустой ответ.")
         except Exception as exc:
             err_str = str(exc)
-            logger.warning(f"Ошибка модели {model_name}: {err_str}")
+            logger.warning(f"Сбой модели {model_name}: {err_str}")
             last_error = exc
             if "404" in err_str or "NOT_FOUND" in err_str:
                 continue
             if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-                await asyncio.sleep(2.0)
+                await asyncio.sleep(1.5)
                 continue
-    raise last_error or RuntimeError("Все AI-модели временно недоступны.")
+
+    raise last_error or RuntimeError("Все доступные AI-модели временно недоступны.")
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else None
 dp = Dispatcher(storage=MemoryStorage())
@@ -921,11 +947,11 @@ async def process_care_tag_photo(message: Message, state: FSMContext):
         err_msg = str(exc)
         logger.error(f"Ошибка при обработке запроса: {exc}", exc_info=True)
         if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
-            err_text = "⏳ Превышен лимит запросов к AI. Пожалуйста, подождите 30 секунд и повторите попытку."
+            err_text = "⏳ Превышен лимит запросов к AI в минуту. Пожалуйста, подождите 30 секунд и нажмите «🔍 Проверить вещь» снова."
         elif "404" in err_msg or "NOT_FOUND" in err_msg:
-            err_text = "⚠️ Модель AI временно недоступна. Попробуйте еще раз через полминуты."
+            err_text = f"⚠️ Модель AI временно недоступна для ключа: {html.escape(err_msg[:80])}."
         else:
-            err_text = f"❌ Не удалось обработать вещь. Причина: {html.escape(err_msg[:120])}"
+            err_text = f"❌ Ошибка обработки: {html.escape(err_msg[:100])}"
 
         try:
             await status_msg.edit_text(err_text, parse_mode="HTML")
