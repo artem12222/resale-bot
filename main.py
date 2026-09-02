@@ -34,19 +34,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Безопасное чтение ключей из переменных окружения
+# ======================== НАСТРОЙКИ И КЛЮЧИ (ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ) ========================
+# Токен телеграм бота и ключ Gemini считываются из защищенных Environment Variables на Render
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "5641374843"))
 
-# Ссылка на банку и очистка от кавычек/пробелов
-RAW_MONOBANK_JAR = os.getenv("MONOBANK_JAR_URL", "https://send.monobank.ua/jar/7E9CVK1jX1")
-MONOBANK_JAR_URL = RAW_MONOBANK_JAR.strip().strip("\"'").rstrip("/")
-if not MONOBANK_JAR_URL or "send.monobank.ua" not in MONOBANK_JAR_URL:
-    MONOBANK_JAR_URL = "https://send.monobank.ua/jar/7E9CVK1jX1"
+ADMIN_USER_ID = 5641374843
 
-MONOBANK_TOKEN = os.getenv("MONOBANK_TOKEN", "").strip().strip("\"'")
-FREE_CHECKS_PER_DAY = int(os.getenv("FREE_CHECKS_PER_DAY", "3"))
+# Ссылка на твою Банку (без токенов, чистая ссылка для перевода)
+MONOBANK_JAR_URL = "https://send.monobank.ua/jar/7E9CVK1jX1"
+
+FREE_CHECKS_PER_DAY = 3
 DB_NAME = "resale_bot.db"
 
 PLANS = {
@@ -264,11 +262,6 @@ def activate_plan(user_id: int, plan_id: str, method: str, amount: float, curren
         )
         conn.commit()
 
-def get_monobank_direct_url(amount_uah: int, user_id: int) -> str:
-    base = MONOBANK_JAR_URL
-    sep = "&" if "?" in base else "?"
-    return f"{base}{sep}a={amount_uah}&t=ID_{user_id}"
-
 class ClothingCheckFSM(StatesGroup):
     waiting_for_main_photo = State()
     waiting_for_neck_tag = State()
@@ -306,7 +299,7 @@ ANALYSIS_PROMPT = """
 
 3. ЛАКОНИЧНЫЕ ПОИСКОВЫЕ ЗАПРОСЫ (МАКСИМУМ 2-3 СЛОВА):
    - search_query_local (для OLX и Шафы): бренд + тип вещи (например: "Pull and Bear футболка", "Zara жилетка").
-   - search_query_global (для eBay/Grailed): бренд + модель латиницей (например: "Pull and Bear STWD tee").
+   - search_query_global (for eBay/Grailed): бренд + модель латиницей (например: "Pull and Bear STWD tee").
 
 Верни СТРОГИЙ JSON без оформления markdown:
 {
@@ -350,13 +343,11 @@ def prepare_image_part(file_stream: io.BytesIO) -> genai_types.Part:
 
 async def analyze_with_gemini_fallback(image_parts: list[genai_types.Part]) -> dict:
     if not ai_client:
-        raise RuntimeError("GEMINI_API_KEY не установлен в переменных окружения.")
-
+        raise RuntimeError("GEMINI_API_KEY не установлен в окружении.")
     last_error = None
     for model_name in CANDIDATE_MODELS:
         for attempt in range(2):
             try:
-                logger.info(f"Обращение к {model_name} (попытка {attempt + 1})...")
                 response = await asyncio.wait_for(
                     asyncio.to_thread(
                         ai_client.models.generate_content,
@@ -378,7 +369,6 @@ async def analyze_with_gemini_fallback(image_parts: list[genai_types.Part]) -> d
                     return json.loads(raw)
             except Exception as exc:
                 err_msg = str(exc)
-                logger.warning(f"Сбой модели {model_name}: {err_msg}")
                 last_error = exc
                 if "404" in err_msg or "NOT_FOUND" in err_msg:
                     break
@@ -475,23 +465,18 @@ async def cb_choose_payment_method(callback: CallbackQuery):
     if not plan:
         return
 
-    user_id = callback.from_user.id
-    direct_mono_url = get_monobank_direct_url(plan["uah"], user_id)
-
     text = (
         f"Вы выбрали: <b>{html.escape(plan['title'])}</b>\n"
         f"📝 <i>{html.escape(plan['description'])}</i>\n\n"
         "💰 <b>Стоимость:</b>\n"
         f"• Через <b>Telegram Stars</b>: <b>{plan['stars']} ⭐</b> (в 1 клик в Telegram)\n"
         f"• Через <b>Монобанк</b>: <b>{plan['uah']} грн</b> (переход на Банку)\n\n"
-        f"⚠️ <b>ВАЖНО:</b> При оплате на Монобанку укажите в комментарии: <code>ID: {user_id}</code>\n\n"
         "Выберите способ оплаты ниже 👇"
     )
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"⭐ Оплатить {plan['stars']} Stars (Telegram)", callback_data=f"pay_stars:{plan_key}")],
-        [InlineKeyboardButton(text=f"💳 Оплатить {plan['uah']} грн (Монобанка) ↗️", url=direct_mono_url)],
-        [InlineKeyboardButton(text="📩 Я оплатил (Отправить чек админу)", callback_data=f"notify_admin_mono:{plan_key}")],
+        [InlineKeyboardButton(text=f"💳 Оплатить {plan['uah']} грн (Монобанка)", callback_data=f"pay_mono:{plan_key}")],
         [InlineKeyboardButton(text="◀️ Назад к тарифам", callback_data="show_plans")]
     ])
     await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
@@ -541,6 +526,33 @@ async def process_successful_stars_payment(message: Message):
         ])
         await message.answer(congrats_text, parse_mode="HTML", reply_markup=kb)
 
+@dp.callback_query(F.data.startswith("pay_mono:"))
+async def cb_pay_mono(callback: CallbackQuery):
+    await callback.answer()
+    plan_key = callback.data.split(":")[1]
+    plan = PLANS.get(plan_key)
+    if not plan:
+        return
+
+    user_id = callback.from_user.id
+    jar_payment_link = f"{MONOBANK_JAR_URL}?a={plan['uah']}"
+
+    text = (
+        f"💳 <b>Оплата через Monobank Банку:</b>\n\n"
+        f"Тариф: <b>{html.escape(plan['title'])}</b>\n"
+        f"Сумма к оплате: <b>{plan['uah']} грн</b>\n\n"
+        f"⚠️ <b>ВАЖНО:</b> При оплате в поле «Коментар» ОБЯЗАТЕЛЬНО укажите ваш ID:\n"
+        f"👉 <code>ID: {user_id}</code> (нажмите, чтобы скопировать)\n\n"
+        "После перевода нажмите кнопку <b>«📩 Я оплатил (Отправить чек админу)»</b> ниже 👇"
+    )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"↗️ Перейти в Банку ({plan['uah']} грн)", url=jar_payment_link)],
+        [InlineKeyboardButton(text="📩 Я оплатил (Отправить чек админу)", callback_data=f"notify_admin_mono:{plan_key}")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="show_plans")]
+    ])
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+
 @dp.callback_query(F.data.startswith("notify_admin_mono:"))
 async def cb_notify_admin_mono(callback: CallbackQuery):
     await callback.answer()
@@ -564,19 +576,16 @@ async def cb_notify_admin_mono(callback: CallbackQuery):
         "Проверьте выписку в приложении Монобанка и подтвердите зачисление:"
     )
 
-    if ADMIN_USER_ID != 0:
-        try:
-            await bot.send_message(ADMIN_USER_ID, admin_msg, parse_mode="HTML", reply_markup=admin_kb)
-            await callback.message.answer(
-                "✅ <b>Запрос отправлен администратору!</b>\n"
-                "После проверки поступления бот мгновенно начислит вам тариф и пришлет сообщение.",
-                parse_mode="HTML"
-            )
-        except Exception as e:
-            logger.error(f"Не удалось уведомить админа: {e}")
-            await callback.message.answer("Заявка зафиксирована. Администратор проверит выписку.")
-    else:
-        await callback.message.answer("Заявка сохранена в базе данных.")
+    try:
+        await bot.send_message(ADMIN_USER_ID, admin_msg, parse_mode="HTML", reply_markup=admin_kb)
+        await callback.message.answer(
+            "✅ <b>Запрос отправлен администратору!</b>\n"
+            "После проверки бот мгновенно начислит вам тариф и пришлет сообщение.",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.error(f"Не удалось уведомить админа: {e}")
+        await callback.message.answer("Заявка зафиксирована. Администратор проверит выписку.")
 
 @dp.callback_query(F.data.startswith("adm_approve:"))
 async def cb_admin_approve(callback: CallbackQuery):
@@ -604,7 +613,6 @@ async def cb_admin_approve(callback: CallbackQuery):
             )
         except Exception:
             pass
-
         await callback.message.edit_text(f"✅ Успешно! Пользователю <code>{target_user_id}</code> выдан тариф {plan['title']}.", parse_mode="HTML")
 
 @dp.callback_query(F.data.startswith("adm_reject:"))
@@ -614,11 +622,7 @@ async def cb_admin_reject(callback: CallbackQuery):
         return
     target_user_id = int(callback.data.split(":")[1])
     try:
-        await bot.send_message(
-            target_user_id,
-            "❌ Платеж пока не был обнаружен в выписке Банки. Пожалуйста, проверьте статус списания средств в приложении.",
-            parse_mode="HTML"
-        )
+        await bot.send_message(target_user_id, "❌ Платеж не был обнаружен в выписке Банки.", parse_mode="HTML")
     except Exception:
         pass
     await callback.message.edit_text(f"❌ Заявка пользователя <code>{target_user_id}</code> отклонена.", parse_mode="HTML")
@@ -649,8 +653,7 @@ async def cb_start_check(callback: CallbackQuery, state: FSMContext):
 
 @dp.message(StateFilter(ClothingCheckFSM.waiting_for_main_photo), F.photo)
 async def process_main_photo(message: Message, state: FSMContext):
-    photo_id = message.photo[-1].file_id
-    await state.update_data(main_photo=photo_id)
+    await state.update_data(main_photo=message.photo[-1].file_id)
     await state.set_state(ClothingCheckFSM.waiting_for_neck_tag)
     await message.answer(
         "🏷 <b>Шаг 2 из 3:</b>\n"
@@ -660,8 +663,7 @@ async def process_main_photo(message: Message, state: FSMContext):
 
 @dp.message(StateFilter(ClothingCheckFSM.waiting_for_neck_tag), F.photo)
 async def process_neck_tag_photo(message: Message, state: FSMContext):
-    photo_id = message.photo[-1].file_id
-    await state.update_data(neck_photo=photo_id)
+    await state.update_data(neck_photo=message.photo[-1].file_id)
     await state.set_state(ClothingCheckFSM.waiting_for_care_tag)
     await message.answer(
         "🧵 <b>Шаг 3 из 3:</b>\n"
@@ -671,19 +673,13 @@ async def process_neck_tag_photo(message: Message, state: FSMContext):
 
 @dp.message(StateFilter(ClothingCheckFSM.waiting_for_care_tag), F.photo)
 async def process_care_tag_photo(message: Message, state: FSMContext):
-    photo_id = message.photo[-1].file_id
     user_data = await state.get_data()
     await state.clear()
-
-    main_photo_id = user_data["main_photo"]
-    neck_photo_id = user_data["neck_photo"]
-    care_photo_id = photo_id
-
     status_msg = await message.answer("⏳ Анализирую бирки, швы и артикулы через Gemini AI... Это займет 3–6 секунд.")
 
     try:
         image_parts = []
-        for pid in [main_photo_id, neck_photo_id, care_photo_id]:
+        for pid in [user_data["main_photo"], user_data["neck_photo"], message.photo[-1].file_id]:
             file_info = await bot.get_file(pid)
             file_stream = io.BytesIO()
             await bot.download_file(file_info.file_path, destination=file_stream)
@@ -737,7 +733,6 @@ async def process_care_tag_photo(message: Message, state: FSMContext):
                 InlineKeyboardButton(text="🛍 eBay (В продаже)", url=links["ebay_active"])
             ]
         ]
-
         if "масс-маркет" not in tier.lower():
             keyboard_buttons.append([InlineKeyboardButton(text="🔥 Grailed Маркет", url=links["grailed"])])
 
@@ -745,17 +740,13 @@ async def process_care_tag_photo(message: Message, state: FSMContext):
         keyboard_buttons.append([InlineKeyboardButton(text="💎 Продлить / Купить тариф", callback_data="show_plans")])
 
         kb = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
-
         await status_msg.delete()
         await message.answer(result_message, parse_mode="HTML", reply_markup=kb)
 
     except Exception as exc:
         logger.error(f"Ошибка при обработке запроса: {exc}", exc_info=True)
         try:
-            await status_msg.edit_text(
-                "❌ Сервера Gemini кратковременно перегружены. "
-                "Пожалуйста, повторите попытку через минуту по кнопке /start."
-            )
+            await status_msg.edit_text("❌ Сервера временно перегружены. Повторите попытку через минуту.")
         except Exception:
             pass
 
@@ -774,12 +765,12 @@ async def start_background_web():
 
 async def main():
     if not TELEGRAM_BOT_TOKEN:
-        logger.error("КРИТИЧЕСКАЯ ОШИБКА: Не задана переменная TELEGRAM_BOT_TOKEN!")
+        logger.error("КРИТИЧЕСКАЯ ОШИБКА: Не задан TELEGRAM_BOT_TOKEN!")
         return
 
     init_db()
     await start_background_web()
-    logger.info("База данных инициализирована. Запуск Telegram бота...")
+    logger.info("Database initialized. Starting Telegram bot polling...")
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
