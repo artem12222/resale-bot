@@ -41,7 +41,12 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "5641374843"))
 
-MONOBANK_JAR_URL = os.getenv("MONOBANK_JAR_URL", "https://send.monobank.ua/jar/7E9CVK1jX1").strip().strip('"').strip("'")
+# Железная защита ссылки на Банку Монобанка (гарантия валидного https:// URL)
+DEFAULT_MONO_JAR = "https://send.monobank.ua/jar/7E9CVK1jX1"
+raw_jar = os.getenv("MONOBANK_JAR_URL", "").strip().strip('"').strip("'")
+MONOBANK_JAR_URL = raw_jar if (raw_jar.startswith("https://") or raw_jar.startswith("http://")) else DEFAULT_MONO_JAR
+MONOBANK_JAR_URL = MONOBANK_JAR_URL.rstrip("/")
+
 MONOBANK_TOKEN = os.getenv("MONOBANK_TOKEN", "").strip()
 
 FREE_CHECKS_PER_DAY = 3
@@ -547,31 +552,51 @@ async def process_successful_stars_payment(message: Message):
 
 @dp.callback_query(F.data.startswith("pay_mono:"))
 async def cb_pay_mono(callback: CallbackQuery):
-    await callback.answer()
-    plan_key = callback.data.split(":")[1]
-    plan = PLANS.get(plan_key)
-    if not plan:
-        return
+    """Обработчик перехода к оплате Монобанка с защитой от сбоев URL."""
+    try:
+        await callback.answer()
+        plan_key = callback.data.split(":")[1]
+        plan = PLANS.get(plan_key)
+        if not plan:
+            return
 
-    user_id = callback.from_user.id
-    jar_payment_link = f"{MONOBANK_JAR_URL}?a={plan['uah']}&t=ID_{user_id}"
+        user_id = callback.from_user.id
+        # Чистый и валидный для Telegram URL с предзаполненной суммой
+        jar_payment_link = f"{MONOBANK_JAR_URL}?a={plan['uah']}"
 
-    text = (
-        f"💳 <b>Оплата через Monobank Банку:</b>\n\n"
-        f"Тариф: <b>{html.escape(plan['title'])}</b>\n"
-        f"Сумма к оплате: <b>{plan['uah']} грн</b>\n\n"
-        f"⚠️ <b>ВАЖНО:</b> При оплате в поле «Коментар» ОБЯЗАТЕЛЬНО укажите ваш ID:\n"
-        f"👉 <code>ID: {user_id}</code> (нажмите, чтобы скопировать)\n\n"
-        "После перевода нажмите кнопку <b>«🔄 Проверить оплату»</b> ниже 👇"
-    )
+        text = (
+            f"💳 <b>Оплата через Monobank Банку:</b>\n\n"
+            f"Тариф: <b>{html.escape(plan['title'])}</b>\n"
+            f"Сумма к оплате: <b>{plan['uah']} грн</b>\n\n"
+            f"⚠️ <b>ВАЖНО:</b> При оплате в поле «Коментар» ОБЯЗАТЕЛЬНО укажите ваш ID:\n"
+            f"👉 <code>ID: {user_id}</code> (нажмите, чтобы скопировать)\n\n"
+            "После перевода нажмите кнопку <b>«🔄 Проверить оплату»</b> ниже 👇"
+        )
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"↗️ Перейти в Банку ({plan['uah']} грн)", url=jar_payment_link)],
-        [InlineKeyboardButton(text="🔄 Проверить оплату", callback_data=f"check_mono:{plan_key}")],
-        [InlineKeyboardButton(text="📩 Я оплатил (Отправить чек админу)", callback_data=f"notify_admin_mono:{plan_key}")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="show_plans")]
-    ])
-    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"↗️ Перейти в Банку ({plan['uah']} грн)", url=jar_payment_link)],
+            [InlineKeyboardButton(text="🔄 Проверить оплату", callback_data=f"check_mono:{plan_key}")],
+            [InlineKeyboardButton(text="📩 Я оплатил (Отправить чек админу)", callback_data=f"notify_admin_mono:{plan_key}")],
+            [InlineKeyboardButton(text="◀️ Назад к тарифам", callback_data="show_plans")]
+        ])
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    except Exception as exc:
+        logger.error(f"Ошибка в cb_pay_mono: {exc}", exc_info=True)
+        # Если Telegram не смог отредактировать сообщение, отправляем новое с кнопкой-ссылкой
+        try:
+            fallback_kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text=f"↗️ Перейти в Банку ({plan['uah']} грн)", url=f"{DEFAULT_MONO_JAR}?a={plan['uah']}")],
+                [InlineKeyboardButton(text="📩 Я оплатил (Отправить чек)", callback_data=f"notify_admin_mono:{plan_key}")]
+            ])
+            await callback.message.answer(
+                f"💳 <b>Ссылка для оплаты {html.escape(plan['title'])}:</b>\n\n"
+                f"Сумма: <b>{plan['uah']} грн</b>\n"
+                f"В комментарии укажите: <code>ID: {callback.from_user.id}</code>",
+                parse_mode="HTML",
+                reply_markup=fallback_kb
+            )
+        except Exception:
+            pass
 
 @dp.callback_query(F.data.startswith("check_mono:"))
 async def cb_check_monobank_statement(callback: CallbackQuery):
