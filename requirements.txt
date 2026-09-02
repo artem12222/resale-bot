@@ -1,4 +1,5 @@
 aiogram
-     google-genai
-     pillow
-     aiohttp
+google-genai
+pillow
+aiohttp
+httpx
