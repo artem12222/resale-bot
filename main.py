@@ -6,7 +6,9 @@ import json
 import logging
 import os
 import re
+import secrets
 import sqlite3
+import string
 from typing import Optional
 import urllib.parse
 
@@ -245,6 +247,18 @@ def init_db():
             created_at TEXT
         )
     """)
+
+    query_db("""
+        CREATE TABLE IF NOT EXISTS promo_codes (
+            code TEXT PRIMARY KEY,
+            plan_id TEXT,
+            created_at TEXT,
+            expires_at TEXT,
+            is_used INTEGER DEFAULT 0,
+            used_by INTEGER DEFAULT NULL,
+            used_at TEXT DEFAULT NULL
+        )
+    """)
     logger.info("База данных инициализирована (Turso Cloud / SQLite)")
 
 def get_user_data(user_id: int, username: Optional[str] = None) -> dict:
@@ -407,6 +421,9 @@ class ClothingCheckFSM(StatesGroup):
     waiting_for_neck_tag = State()
     waiting_for_care_tag = State()
 
+class PromoInputFSM(StatesGroup):
+    waiting_for_promo_code = State()
+
 ANALYSIS_PROMPT = """
 Ты — профессиональный эксперт по ресейлу, оценке и легит-чеку ЛЮБОЙ одежды, обуви (кроссовок) и аксессуаров.
 Тебе отправлены 3 фотографии одной вещи:
@@ -565,7 +582,8 @@ def get_main_menu_keyboard():
         [
             InlineKeyboardButton(text="💎 Тарифы и Безлимит", callback_data="show_plans"),
             InlineKeyboardButton(text="👤 Мой профиль", callback_data="show_profile")
-        ]
+        ],
+        [InlineKeyboardButton(text="🎟 Ввести промокод", callback_data="enter_promo")]
     ])
 
 def get_plans_keyboard():
@@ -906,6 +924,141 @@ async def cb_admin_reject(callback: CallbackQuery):
     except Exception:
         pass
     await callback.message.edit_text(f"❌ Заявка пользователя <code>{target_user_id}</code> отклонена.", parse_mode="HTML")
+
+def get_admin_promo_keyboard():
+    buttons = []
+    for plan_key, plan in PLANS.items():
+        buttons.append([InlineKeyboardButton(text=f"🎟 {plan['title']}", callback_data=f"gen_promo:{plan_key}")])
+    buttons.append([InlineKeyboardButton(text="◀️ В меню", callback_data="back_to_main")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def generate_random_promo_code() -> str:
+    chars = string.ascii_uppercase + string.digits
+    part1 = "".join(secrets.choice(chars) for _ in range(4))
+    part2 = "".join(secrets.choice(chars) for _ in range(4))
+    return f"CRIM-{part1}-{part2}"
+
+async def apply_promo_code_logic(user_id: int, raw_code: str) -> tuple[bool, str]:
+    clean_code = raw_code.strip().upper()
+    rows = query_db("SELECT * FROM promo_codes WHERE code = ?", (clean_code,))
+    if not rows:
+        return False, "❌ Промокод не существует или введен неверно."
+
+    promo = rows[0]
+    if int(promo.get("is_used") or 0) == 1:
+        return False, "⚠️ Этот промокод уже был активирован ранее."
+
+    expires_at_str = promo.get("expires_at")
+    if expires_at_str:
+        try:
+            expires_at = datetime.fromisoformat(expires_at_str)
+            if datetime.now() > expires_at:
+                return False, "⏳ Срок действия этого промокода (7 дней) истёк."
+        except Exception:
+            pass
+
+    plan_key = promo.get("plan_id")
+    plan = PLANS.get(plan_key)
+    if not plan:
+        return False, "❌ Ошибка: связанный тариф не найден."
+
+    now_iso = datetime.now().isoformat()
+    query_db(
+        "UPDATE promo_codes SET is_used = 1, used_by = ?, used_at = ? WHERE code = ?",
+        (user_id, now_iso, clean_code)
+    )
+    activate_plan(user_id, plan_key, "promo_code", 0.0, "PROMO")
+    u = get_user_data(user_id)
+    success_text = (
+        "🎉 <b>Промокод успешно активирован!</b>\n\n"
+        f"Вам начислен тариф: <b>{html.escape(plan['title'])}</b>.\n"
+        f"📊 Ваш баланс: <b>{html.escape(u['status_text'])}</b>.\n\n"
+        "Приятного пользования!"
+    )
+    return True, success_text
+
+@dp.message(Command("promo"))
+async def cmd_promo(message: Message):
+    if message.from_user.id != ADMIN_USER_ID:
+        parts = message.text.split(maxsplit=1)
+        if len(parts) > 1:
+            ok, response_text = await apply_promo_code_logic(message.from_user.id, parts[1])
+            await message.answer(response_text, parse_mode="HTML", reply_markup=get_main_menu_keyboard())
+            return
+        await message.answer(
+            "⛔ Команда создания промокодов доступна только администратору.\n\n"
+            "Чтобы активировать промокод, нажмите кнопку <b>«🎟 Ввести промокод»</b> в главном меню или отправьте <code>/code ВАШ_КОД</code>.",
+            parse_mode="HTML"
+        )
+        return
+
+    text = (
+        "👑 <b>Генератор промокодов (Панель Администратора)</b>\n\n"
+        "Выберите тариф из списка ниже, на который вы хотите выпустить промокод.\n"
+        "Каждый промокод создается со сроком действия <b>7 дней</b> и сохраняется в облачную базу данных Turso."
+    )
+    await message.answer(text, parse_mode="HTML", reply_markup=get_admin_promo_keyboard())
+
+@dp.callback_query(F.data.startswith("gen_promo:"))
+async def cb_generate_promo(callback: CallbackQuery):
+    await callback.answer()
+    if callback.from_user.id != ADMIN_USER_ID:
+        return
+
+    plan_key = callback.data.split(":")[1]
+    plan = PLANS.get(plan_key)
+    if not plan:
+        return
+
+    code = generate_random_promo_code()
+    now = datetime.now()
+    expires_at = now + timedelta(days=7)
+    expires_str = expires_at.strftime("%d.%m.%Y %H:%M")
+
+    query_db(
+        "INSERT INTO promo_codes (code, plan_id, created_at, expires_at, is_used) VALUES (?, ?, ?, ?, 0)",
+        (code, plan_key, now.isoformat(), expires_at.isoformat())
+    )
+
+    reply_text = (
+        "🎟 <b>Промокод успешно создан!</b>\n\n"
+        f"📦 Тариф: <b>{html.escape(plan['title'])}</b>\n"
+        f"🔑 Код: <code>{code}</code> (нажмите, чтобы скопировать)\n"
+        f"⏳ Срок действия: <b>7 дней</b> (до {expires_str})\n\n"
+        "Передайте этот код пользователю. Он сможет применить его через кнопку «🎟 Ввести промокод» или команду <code>/code</code>."
+    )
+    await callback.message.edit_text(reply_text, parse_mode="HTML", reply_markup=get_admin_promo_keyboard())
+
+@dp.callback_query(F.data == "enter_promo")
+async def cb_enter_promo(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.set_state(PromoInputFSM.waiting_for_promo_code)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ Отмена", callback_data="back_to_main")]
+    ])
+    await callback.message.answer(
+        "🎟 <b>Активация промокода</b>\n\n"
+        "Отправьте ваш промокод ответным сообщением в чат:",
+        parse_mode="HTML",
+        reply_markup=kb
+    )
+
+@dp.message(Command("code"))
+async def cmd_code(message: Message, state: FSMContext):
+    parts = message.text.split(maxsplit=1)
+    if len(parts) > 1:
+        await state.clear()
+        ok, res_text = await apply_promo_code_logic(message.from_user.id, parts[1])
+        await message.answer(res_text, parse_mode="HTML", reply_markup=get_main_menu_keyboard())
+    else:
+        await state.set_state(PromoInputFSM.waiting_for_promo_code)
+        await message.answer("🎟 Отправьте ваш промокод ответным сообщением:", parse_mode="HTML")
+
+@dp.message(StateFilter(PromoInputFSM.waiting_for_promo_code), F.text)
+async def process_promo_input(message: Message, state: FSMContext):
+    await state.clear()
+    ok, res_text = await apply_promo_code_logic(message.from_user.id, message.text)
+    await message.answer(res_text, parse_mode="HTML", reply_markup=get_main_menu_keyboard())
 
 @dp.callback_query(F.data == "start_check")
 async def cb_start_check(callback: CallbackQuery, state: FSMContext):
