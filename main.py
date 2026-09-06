@@ -37,18 +37,28 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-
 ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "5641374843"))
 
 RAW_JAR_URL = os.getenv("MONOBANK_JAR_URL", "https://send.monobank.ua/jar/7E9CVK1jX1").strip().strip('"').strip("'")
 if not RAW_JAR_URL.startswith("http"):
     RAW_JAR_URL = "https://send.monobank.ua/jar/7E9CVK1jX1"
 MONOBANK_JAR_URL = RAW_JAR_URL
-
 MONOBANK_TOKEN = os.getenv("MONOBANK_TOKEN", "").strip()
 
 FREE_CHECKS_PER_DAY = 3
 DB_NAME = "resale_bot.db"
+
+# Облачные учетные данные базы Turso (libSQL)
+DEFAULT_TURSO_URL = "libsql://resale-db-artem12222.aws-ap-south-1.turso.io"
+DEFAULT_TURSO_TOKEN = (
+    "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJleHAiOjc5NzQzNzI1NDUsImlhdCI6MTc4ODczNzM0NSwiaWQiOiIw"
+    "MWEwNzkwYy1kZTAxLTc0ZDYtODI4YS04OTI4MzNiZTZhNzAiLCJraWQiOiJjbzRQNUNYMW5raXdXN3VVWVRCNXVHX1V2ejl2N2x3LTV"
+    "2MVU1ZzlTbTdZIiwicmlkIjoiYzBkMDYyNjQtY2RhMy00NTc2LTg3ZWEtMzE4ZTllNGEyZTMyIn0.vBqQN4hxC2rctguUkmbUF1RNti"
+    "3DN6yEuKQ7QrFeE18fHXxbByhLC7iLsej9SBYbzQtJvpvInaH4m9MljEfmBQ"
+)
+
+TURSO_DB_URL = os.getenv("TURSO_DB_URL", DEFAULT_TURSO_URL).strip()
+TURSO_DB_TOKEN = os.getenv("TURSO_DB_TOKEN", DEFAULT_TURSO_TOKEN).strip()
 
 PLANS = {
     "pack_15": {
@@ -93,6 +103,265 @@ PLANS = {
     }
 }
 
+class TursoHTTPClient:
+    """Отказоустойчивый клиент для Turso Cloud через стандартный протокол /v2/pipeline."""
+    def __init__(self, db_url: str, auth_token: str):
+        endpoint = db_url.strip()
+        if endpoint.startswith("libsql://"):
+            endpoint = "https://" + endpoint[len("libsql://"):]
+        elif endpoint.startswith("turso://"):
+            endpoint = "https://" + endpoint[len("turso://"):]
+        if not endpoint.endswith("/v2/pipeline"):
+            endpoint = endpoint.rstrip("/") + "/v2/pipeline"
+
+        self.endpoint = endpoint
+        self.auth_token = auth_token.strip()
+        self.headers = {
+            "Authorization": f"Bearer {self.auth_token}",
+            "Content-Type": "application/json"
+        }
+
+    def _convert_arg(self, val):
+        if val is None:
+            return {"type": "null"}
+        elif isinstance(val, bool):
+            return {"type": "integer", "value": "1" if val else "0"}
+        elif isinstance(val, int):
+            return {"type": "integer", "value": str(val)}
+        elif isinstance(val, float):
+            return {"type": "float", "value": val}
+        return {"type": "text", "value": str(val)}
+
+    def execute(self, sql: str, params: tuple = ()) -> list[dict]:
+        stmt = {"sql": sql}
+        if params:
+            stmt["args"] = [self._convert_arg(p) for p in params]
+
+        payload = {
+            "requests": [
+                {"type": "execute", "stmt": stmt},
+                {"type": "close"}
+            ]
+        }
+
+        with httpx.Client(timeout=12.0) as client:
+            resp = client.post(self.endpoint, headers=self.headers, json=payload)
+            if resp.status_code != 200:
+                raise RuntimeError(f"Turso API {resp.status_code}: {resp.text}")
+
+            data = resp.json()
+            results = data.get("results", [])
+            if not results:
+                return []
+
+            first = results[0]
+            if first.get("type") == "error":
+                raise RuntimeError(f"Turso SQL Error: {first.get('error')}")
+
+            res = first.get("response", {}).get("result", {})
+            cols = [c.get("name") for c in res.get("cols", [])]
+            raw_rows = res.get("rows", [])
+
+            output_rows = []
+            for r in raw_rows:
+                row_dict = {}
+                for col_name, cell in zip(cols, r):
+                    if not isinstance(cell, dict):
+                        row_dict[col_name] = cell
+                        continue
+                    cell_type = cell.get("type")
+                    cell_val = cell.get("value")
+                    if cell_type == "null" or cell_val is None:
+                        row_dict[col_name] = None
+                    elif cell_type == "integer":
+                        row_dict[col_name] = int(cell_val)
+                    elif cell_type == "float":
+                        row_dict[col_name] = float(cell_val)
+                    else:
+                        row_dict[col_name] = cell_val
+                output_rows.append(row_dict)
+            return output_rows
+
+turso_client: Optional[TursoHTTPClient] = None
+if TURSO_DB_URL and TURSO_DB_TOKEN:
+    try:
+        turso_client = TursoHTTPClient(TURSO_DB_URL, TURSO_DB_TOKEN)
+        logger.info("Turso Cloud клиент успешно настроен.")
+    except Exception as e:
+        logger.warning(f"Не удалось инициализировать Turso клиент: {e}")
+        turso_client = None
+
+def query_db(sql: str, params: tuple = ()) -> list[dict]:
+    """Выполняет SQL-запрос в Turso Cloud. При сетевом сбое мягко переключается на локальный SQLite."""
+    if turso_client:
+        try:
+            return turso_client.execute(sql, params)
+        except Exception as e:
+            logger.error(f"Turso Cloud запрос не удался ({e}), используем локальный fallback.")
+
+    with sqlite3.connect(DB_NAME) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        if sql.strip().upper().startswith(("INSERT", "UPDATE", "DELETE", "CREATE", "ALTER")):
+            conn.commit()
+        if cur.description:
+            cols = [d[0] for d in cur.description]
+            return [dict(zip(cols, row)) for row in cur.fetchall()]
+        return []
+
+def init_db():
+    query_db("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            checks_today INTEGER DEFAULT 0,
+            last_check_date TEXT,
+            is_premium INTEGER DEFAULT 0,
+            extra_checks INTEGER DEFAULT 0,
+            premium_until TEXT DEFAULT NULL,
+            is_lifetime INTEGER DEFAULT 0
+        )
+    """)
+
+    query_db("""
+        CREATE TABLE IF NOT EXISTS payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            plan_id TEXT,
+            amount REAL,
+            currency TEXT,
+            method TEXT,
+            status TEXT,
+            created_at TEXT
+        )
+    """)
+
+    query_db("""
+        CREATE TABLE IF NOT EXISTS processed_transactions (
+            tx_id TEXT PRIMARY KEY,
+            user_id INTEGER,
+            amount_kopecks INTEGER,
+            created_at TEXT
+        )
+    """)
+    logger.info("База данных инициализирована (Turso Cloud / SQLite)")
+
+def get_user_data(user_id: int, username: Optional[str] = None) -> dict:
+    today_str = str(date.today())
+    rows = query_db("SELECT * FROM users WHERE user_id = ?", (user_id,))
+
+    if not rows:
+        query_db(
+            """INSERT INTO users (user_id, username, checks_today, last_check_date, is_premium, extra_checks, premium_until, is_lifetime) 
+               VALUES (?, ?, 0, ?, 0, 0, NULL, 0)""",
+            (user_id, username, today_str)
+        )
+        return {
+            "user_id": user_id,
+            "checks_today": 0,
+            "extra_checks": 0,
+            "premium_until": None,
+            "is_lifetime": 0,
+            "status_text": f"{FREE_CHECKS_PER_DAY} бесплатных на сегодня"
+        }
+
+    row = rows[0]
+    checks_today = int(row.get("checks_today") or 0)
+    last_date = row.get("last_check_date")
+    extra_checks = int(row.get("extra_checks") or 0)
+    premium_until = row.get("premium_until")
+    is_lifetime = int(row.get("is_lifetime") or 0)
+
+    if last_date != today_str:
+        checks_today = 0
+        query_db("UPDATE users SET checks_today = 0, last_check_date = ? WHERE user_id = ?", (today_str, user_id))
+
+    if is_lifetime:
+        status_text = "♾ VIP Навсегда (Безлимит)"
+    elif premium_until and premium_until >= today_str:
+        status_text = f"👑 Безлимит активен до {premium_until}"
+    elif extra_checks > 0:
+        free_rem = max(0, FREE_CHECKS_PER_DAY - checks_today)
+        status_text = f"{free_rem} беспл. + {extra_checks} из пакета"
+    else:
+        free_rem = max(0, FREE_CHECKS_PER_DAY - checks_today)
+        status_text = f"{free_rem} из {FREE_CHECKS_PER_DAY} бесплатных"
+
+    return {
+        "user_id": user_id,
+        "checks_today": checks_today,
+        "extra_checks": extra_checks,
+        "premium_until": premium_until,
+        "is_lifetime": is_lifetime,
+        "status_text": status_text
+    }
+
+def check_can_proceed(user_id: int) -> bool:
+    u = get_user_data(user_id)
+    today_str = str(date.today())
+    if u["is_lifetime"]:
+        return True
+    if u["premium_until"] and u["premium_until"] >= today_str:
+        return True
+    if u["checks_today"] < FREE_CHECKS_PER_DAY:
+        return True
+    if u["extra_checks"] > 0:
+        return True
+    return False
+
+def decrement_check(user_id: int):
+    u = get_user_data(user_id)
+    today_str = str(date.today())
+    if u["is_lifetime"]:
+        return
+    if u["premium_until"] and u["premium_until"] >= today_str:
+        return
+
+    if u["checks_today"] < FREE_CHECKS_PER_DAY:
+        query_db(
+            "UPDATE users SET checks_today = checks_today + 1, last_check_date = ? WHERE user_id = ?",
+            (today_str, user_id)
+        )
+    elif u["extra_checks"] > 0:
+        query_db(
+            "UPDATE users SET extra_checks = extra_checks - 1 WHERE user_id = ?",
+            (user_id,)
+        )
+
+def activate_plan(user_id: int, plan_id: str, method: str, amount: float, currency: str):
+    plan = PLANS.get(plan_id)
+    if not plan:
+        return
+
+    today = date.today()
+    rows = query_db("SELECT premium_until, extra_checks, is_lifetime FROM users WHERE user_id = ?", (user_id,))
+    cur_until = rows[0].get("premium_until") if rows else None
+    cur_extra = int(rows[0].get("extra_checks") or 0) if rows else 0
+
+    if plan["type"] == "lifetime":
+        query_db("UPDATE users SET is_lifetime = 1 WHERE user_id = ?", (user_id,))
+    elif plan["type"] == "days":
+        base_date = today
+        if cur_until:
+            try:
+                parsed = datetime.strptime(cur_until, "%Y-%m-%d").date()
+                if parsed >= today:
+                    base_date = parsed
+            except Exception:
+                pass
+        new_until = str(base_date + timedelta(days=plan["amount"]))
+        query_db("UPDATE users SET premium_until = ? WHERE user_id = ?", (new_until, user_id))
+    elif plan["type"] == "checks":
+        new_checks = cur_extra + plan["amount"]
+        query_db("UPDATE users SET extra_checks = ? WHERE user_id = ?", (new_checks, user_id))
+
+    query_db(
+        """INSERT INTO payments (user_id, plan_id, amount, currency, method, status, created_at)
+           VALUES (?, ?, ?, ?, ?, 'success', ?)""",
+        (user_id, plan_id, amount, currency, method, datetime.now().isoformat())
+    )
+
 try:
     ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 except Exception as err:
@@ -102,7 +371,7 @@ except Exception as err:
 CACHED_MODELS: list[str] = []
 
 def get_candidate_models() -> list[str]:
-    """Автоматически запрашивает у Google список поддерживаемых моделей для текущего API ключа."""
+    """Динамически запрашивает поддерживаемые модели Google AI для вашего API-ключа."""
     global CACHED_MODELS
     if CACHED_MODELS:
         return CACHED_MODELS
@@ -132,180 +401,6 @@ def get_candidate_models() -> list[str]:
     CACHED_MODELS = result
     logger.info(f"Итоговый порядок моделей для проверок: {CACHED_MODELS}")
     return CACHED_MODELS
-
-def init_db():
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                checks_today INTEGER DEFAULT 0,
-                last_check_date TEXT,
-                is_premium INTEGER DEFAULT 0,
-                extra_checks INTEGER DEFAULT 0,
-                premium_until TEXT DEFAULT NULL,
-                is_lifetime INTEGER DEFAULT 0
-            )
-        """)
-        cursor.execute("PRAGMA table_info(users)")
-        cols = [c[1] for c in cursor.fetchall()]
-        if "extra_checks" not in cols:
-            cursor.execute("ALTER TABLE users ADD COLUMN extra_checks INTEGER DEFAULT 0")
-        if "premium_until" not in cols:
-            cursor.execute("ALTER TABLE users ADD COLUMN premium_until TEXT DEFAULT NULL")
-        if "is_lifetime" not in cols:
-            cursor.execute("ALTER TABLE users ADD COLUMN is_lifetime INTEGER DEFAULT 0")
-
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS payments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                plan_id TEXT,
-                amount REAL,
-                currency TEXT,
-                method TEXT,
-                status TEXT,
-                created_at TEXT
-            )
-        """)
-
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS processed_transactions (
-                tx_id TEXT PRIMARY KEY,
-                user_id INTEGER,
-                amount_kopecks INTEGER,
-                created_at TEXT
-            )
-        """)
-        conn.commit()
-
-def get_user_data(user_id: int, username: Optional[str] = None) -> dict:
-    today_str = str(date.today())
-    with sqlite3.connect(DB_NAME) as conn:
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
-        row = cursor.fetchone()
-
-        if not row:
-            cursor.execute(
-                """INSERT INTO users (user_id, username, checks_today, last_check_date, is_premium, extra_checks, premium_until, is_lifetime) 
-                   VALUES (?, ?, 0, ?, 0, 0, NULL, 0)""",
-                (user_id, username, today_str)
-            )
-            conn.commit()
-            return {
-                "user_id": user_id,
-                "checks_today": 0,
-                "extra_checks": 0,
-                "premium_until": None,
-                "is_lifetime": 0,
-                "status_text": f"{FREE_CHECKS_PER_DAY} бесплатных на сегодня"
-            }
-
-        checks_today = row["checks_today"]
-        last_date = row["last_check_date"]
-        extra_checks = row["extra_checks"]
-        premium_until = row["premium_until"]
-        is_lifetime = row["is_lifetime"]
-
-        if last_date != today_str:
-            checks_today = 0
-            cursor.execute("UPDATE users SET checks_today = 0, last_check_date = ? WHERE user_id = ?", (today_str, user_id))
-            conn.commit()
-
-        if is_lifetime:
-            status_text = "♾ VIP Навсегда (Безлимит)"
-        elif premium_until and premium_until >= today_str:
-            status_text = f"👑 Безлимит активен до {premium_until}"
-        elif extra_checks > 0:
-            free_rem = max(0, FREE_CHECKS_PER_DAY - checks_today)
-            status_text = f"{free_rem} беспл. + {extra_checks} из пакета"
-        else:
-            free_rem = max(0, FREE_CHECKS_PER_DAY - checks_today)
-            status_text = f"{free_rem} из {FREE_CHECKS_PER_DAY} бесплатных"
-
-        return {
-            "user_id": user_id,
-            "checks_today": checks_today,
-            "extra_checks": extra_checks,
-            "premium_until": premium_until,
-            "is_lifetime": is_lifetime,
-            "status_text": status_text
-        }
-
-def check_can_proceed(user_id: int) -> bool:
-    u = get_user_data(user_id)
-    today_str = str(date.today())
-    if u["is_lifetime"]:
-        return True
-    if u["premium_until"] and u["premium_until"] >= today_str:
-        return True
-    if u["checks_today"] < FREE_CHECKS_PER_DAY:
-        return True
-    if u["extra_checks"] > 0:
-        return True
-    return False
-
-def decrement_check(user_id: int):
-    u = get_user_data(user_id)
-    today_str = str(date.today())
-    if u["is_lifetime"]:
-        return
-    if u["premium_until"] and u["premium_until"] >= today_str:
-        return
-
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        if u["checks_today"] < FREE_CHECKS_PER_DAY:
-            cursor.execute(
-                "UPDATE users SET checks_today = checks_today + 1, last_check_date = ? WHERE user_id = ?",
-                (today_str, user_id)
-            )
-        elif u["extra_checks"] > 0:
-            cursor.execute(
-                "UPDATE users SET extra_checks = extra_checks - 1 WHERE user_id = ?",
-                (user_id,)
-            )
-        conn.commit()
-
-def activate_plan(user_id: int, plan_id: str, method: str, amount: float, currency: str):
-    plan = PLANS.get(plan_id)
-    if not plan:
-        return
-
-    today = date.today()
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT premium_until, extra_checks, is_lifetime FROM users WHERE user_id = ?", (user_id,))
-        row = cursor.fetchone()
-        cur_until = row[0] if row else None
-        cur_extra = row[1] if row else 0
-
-        if plan["type"] == "lifetime":
-            cursor.execute("UPDATE users SET is_lifetime = 1 WHERE user_id = ?", (user_id,))
-        elif plan["type"] == "days":
-            base_date = today
-            if cur_until:
-                try:
-                    parsed = datetime.strptime(cur_until, "%Y-%m-%d").date()
-                    if parsed >= today:
-                        base_date = parsed
-                except Exception:
-                    pass
-            new_until = str(base_date + timedelta(days=plan["amount"]))
-            cursor.execute("UPDATE users SET premium_until = ? WHERE user_id = ?", (new_until, user_id))
-        elif plan["type"] == "checks":
-            new_checks = cur_extra + plan["amount"]
-            cursor.execute("UPDATE users SET extra_checks = ? WHERE user_id = ?", (new_checks, user_id))
-
-        cursor.execute(
-            """INSERT INTO payments (user_id, plan_id, amount, currency, method, status, created_at)
-               VALUES (?, ?, ?, ?, ?, 'success', ?)""",
-            (user_id, plan_id, amount, currency, method, datetime.now().isoformat())
-        )
-        conn.commit()
 
 class ClothingCheckFSM(StatesGroup):
     waiting_for_main_photo = State()
@@ -341,7 +436,7 @@ ANALYSIS_PROMPT = """
 
 КРИТИЧЕСКИЕ ТРЕБОВАНИЯ:
 - Верни ИСКЛЮЧИТЕЛЬНО валидный JSON без оберток markdown (без ```json).
-- Внутри строковых значений НЕ используй двойные кавычки.
+- Внутри строковых значений НЕ используй двойные кавычки (заменяй их на одинарные).
 
 Структура JSON:
 {
@@ -394,7 +489,7 @@ def extract_clean_json(text: str) -> dict:
     if cleaned.startswith("```"):
         cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
         cleaned = re.sub(r"\s*```$", "", cleaned)
-    
+
     start_idx = cleaned.find("{")
     end_idx = cleaned.rfind("}")
     if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
@@ -638,7 +733,7 @@ async def cb_pay_mono(callback: CallbackQuery):
         [InlineKeyboardButton(text="📩 Я оплатил (Отправить чек админу)", callback_data=f"notify_admin_mono:{plan_key}")],
         [InlineKeyboardButton(text="◀️ Назад к тарифам", callback_data="show_plans")]
     ])
-    
+
     try:
         await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
     except Exception as e:
@@ -698,27 +793,24 @@ async def cb_check_monobank_statement(callback: CallbackQuery):
                 found_tx = None
                 expected_kopecks = int(plan["uah"] * 100)
 
-                with sqlite3.connect(DB_NAME) as conn:
-                    cursor = conn.cursor()
-                    cursor.execute("SELECT tx_id FROM processed_transactions")
-                    used_tx_ids = set(row[0] for row in cursor.fetchall())
+                used_rows = query_db("SELECT tx_id FROM processed_transactions")
+                used_tx_ids = set(str(r["tx_id"]) for r in used_rows)
 
-                    for tx in transactions:
-                        tx_id = str(tx.get("id", ""))
-                        if tx_id in used_tx_ids:
-                            continue
+                for tx in transactions:
+                    tx_id = str(tx.get("id", ""))
+                    if tx_id in used_tx_ids:
+                        continue
 
-                        comment = str(tx.get("comment", "")) + " " + str(tx.get("description", ""))
-                        amount = tx.get("amount", 0)
+                    comment = str(tx.get("comment", "")) + " " + str(tx.get("description", ""))
+                    amount = tx.get("amount", 0)
 
-                        if str(user_id) in comment and amount >= expected_kopecks:
-                            found_tx = tx
-                            cursor.execute(
-                                "INSERT INTO processed_transactions (tx_id, user_id, amount_kopecks, created_at) VALUES (?, ?, ?, ?)",
-                                (tx_id, user_id, amount, datetime.now().isoformat())
-                            )
-                            conn.commit()
-                            break
+                    if str(user_id) in comment and amount >= expected_kopecks:
+                        found_tx = tx
+                        query_db(
+                            "INSERT INTO processed_transactions (tx_id, user_id, amount_kopecks, created_at) VALUES (?, ?, ?, ?)",
+                            (tx_id, user_id, amount, datetime.now().isoformat())
+                        )
+                        break
 
                 if found_tx:
                     activate_plan(user_id, plan_key, "monobank_auto", plan["uah"], "UAH")
@@ -959,7 +1051,7 @@ async def process_care_tag_photo(message: Message, state: FSMContext):
             pass
 
 async def handle_health_check(request):
-    return web.Response(text="Bot is running 24/7!", status=200)
+    return web.Response(text="Bot is running 24/7 with Turso Cloud DB!", status=200)
 
 async def start_background_web():
     app = web.Application()
