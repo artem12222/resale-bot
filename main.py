@@ -440,6 +440,7 @@ def activate_plan(user_id: int, plan_id: str, method: str, amount: float, curren
                     )
                 )
 
+try:
     ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 except Exception as err:
     logger.error(f"Ошибка настройки Gemini API: {err}")
@@ -1102,12 +1103,6 @@ async def apply_promo_code_logic(user_id: int, raw_code: str) -> tuple[bool, str
     )
     return True, success_text
 
-def generate_random_promo_code() -> str:
-    chars = string.ascii_uppercase + string.digits
-    part1 = "".join(secrets.choice(chars) for _ in range(4))
-    part2 = "".join(secrets.choice(chars) for _ in range(4))
-    return f"CRIM-{part1}-{part2}"
-
 def generate_blogger_promo_code(blogger_prefix: str) -> str:
     clean_prefix = re.sub(r"[^A-Za-z0-9]", "", blogger_prefix).upper()[:5]
     if not clean_prefix:
@@ -1267,6 +1262,7 @@ async def cb_back_to_blog_menu(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await cmd_promoblog(callback.message, state)
 
+@dp.message(Command("promo"))
 async def cmd_promo(message: Message):
     if message.from_user.id != ADMIN_USER_ID:
         parts = message.text.split(maxsplit=1)
