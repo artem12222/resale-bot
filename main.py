@@ -259,6 +259,36 @@ def init_db():
             used_at TEXT DEFAULT NULL
         )
     """)
+
+    query_db("""
+        CREATE TABLE IF NOT EXISTS bloggers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tag TEXT UNIQUE,
+            promo_code TEXT UNIQUE,
+            plan_id TEXT,
+            created_at TEXT,
+            earnings_uah REAL DEFAULT 0.0,
+            earnings_stars INTEGER DEFAULT 0,
+            total_referrals INTEGER DEFAULT 0
+        )
+    """)
+
+    query_db("""
+        CREATE TABLE IF NOT EXISTS blogger_promo_uses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            blogger_id INTEGER,
+            user_id INTEGER,
+            used_at TEXT,
+            UNIQUE(blogger_id, user_id)
+        )
+    """)
+
+    # Добавляем колонку реферера в таблицу пользователей, если ее еще нет
+    try:
+        query_db("ALTER TABLE users ADD COLUMN referred_by_blogger TEXT DEFAULT NULL")
+    except Exception:
+        pass
+
     logger.info("База данных инициализирована (Turso Cloud / SQLite)")
 
 def get_user_data(user_id: int, username: Optional[str] = None) -> dict:
@@ -376,7 +406,40 @@ def activate_plan(user_id: int, plan_id: str, method: str, amount: float, curren
         (user_id, plan_id, amount, currency, method, datetime.now().isoformat())
     )
 
-try:
+    if amount > 0:
+        user_rows = query_db("SELECT referred_by_blogger FROM users WHERE user_id = ?", (user_id,))
+        blogger_tag = user_rows[0].get("referred_by_blogger") if user_rows else None
+
+        if blogger_tag:
+            blogger_data = query_db("SELECT * FROM bloggers WHERE tag = ?", (blogger_tag,))
+            if blogger_data:
+                b = blogger_data[0]
+                if currency == "UAH":
+                    commission = round(amount * 0.20, 2)
+                    new_earnings = round((b.get("earnings_uah") or 0.0) + commission, 2)
+                    query_db("UPDATE bloggers SET earnings_uah = ? WHERE id = ?", (new_earnings, b["id"]))
+                    comm_text = f"<b>+{commission} грн</b> (20% от {amount} грн)"
+                elif currency == "XTR":
+                    commission_stars = int(amount * 0.20)
+                    new_stars = int((b.get("earnings_stars") or 0) + commission_stars)
+                    query_db("UPDATE bloggers SET earnings_stars = ? WHERE id = ?", (new_stars, b["id"]))
+                    comm_text = f"<b>+{commission_stars} ⭐</b> (20% от {amount} ⭐)"
+                else:
+                    comm_text = f"<b>20%</b> от {amount} {currency}"
+
+                asyncio.create_task(
+                    bot.send_message(
+                        ADMIN_USER_ID,
+                        f"💰 <b>Реферальное начисление блогеру!</b>\n\n"
+                        f"👤 Блогер: <b>{html.escape(str(blogger_tag))}</b>\n"
+                        f"🛍 Покупка пользователя: <code>{user_id}</code>\n"
+                        f"📦 Тариф: <b>{html.escape(plan['title'])}</b>\n"
+                        f"💵 Начислено блогеру: {comm_text}\n\n"
+                        f"Проверить балансы всех блогеров: <code>/promoblog</code>",
+                        parse_mode="HTML"
+                    )
+                )
+
     ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 except Exception as err:
     logger.error(f"Ошибка настройки Gemini API: {err}")
@@ -423,6 +486,9 @@ class ClothingCheckFSM(StatesGroup):
 
 class PromoInputFSM(StatesGroup):
     waiting_for_promo_code = State()
+
+class BloggerPromoFSM(StatesGroup):
+    waiting_for_blogger_tag = State()
 
 ANALYSIS_PROMPT = """
 Ты — профессиональный эксперт по ресейлу, оценке и легит-чеку ЛЮБОЙ одежды, обуви (кроссовок) и аксессуаров.
@@ -941,8 +1007,67 @@ def generate_random_promo_code() -> str:
 async def apply_promo_code_logic(user_id: int, raw_code: str) -> tuple[bool, str]:
     clean_code = raw_code.strip().upper()
     rows = query_db("SELECT * FROM promo_codes WHERE code = ?", (clean_code,))
+    
     if not rows:
-        return False, "❌ Промокод не существует или введен неверно."
+        # Проверяем, не является ли промокод кодом от блогера
+        blogger_rows = query_db("SELECT * FROM bloggers WHERE promo_code = ?", (clean_code,))
+        if not blogger_rows:
+            return False, "❌ Промокод не существует или введен неверно."
+
+        blogger = blogger_rows[0]
+        blogger_id = blogger["id"]
+        blogger_tag = blogger.get("tag", "Блогер")
+        plan_key = blogger.get("plan_id")
+        plan = PLANS.get(plan_key)
+        if not plan:
+            return False, "❌ Ошибка: связанный тариф не найден."
+
+        # Проверяем, не активировал ли этот пользователь промокод данного блогера ранее
+        already_used = query_db(
+            "SELECT id FROM blogger_promo_uses WHERE blogger_id = ? AND user_id = ?",
+            (blogger_id, user_id)
+        )
+        if already_used:
+            return False, "⚠️ Вы уже активировали бонусный промокод от этого блогера ранее."
+
+        now_iso = datetime.now().isoformat()
+        query_db(
+            "INSERT INTO blogger_promo_uses (blogger_id, user_id, used_at) VALUES (?, ?, ?)",
+            (blogger_id, user_id, now_iso)
+        )
+        query_db(
+            "UPDATE bloggers SET total_referrals = total_referrals + 1 WHERE id = ?",
+            (blogger_id,)
+        )
+        # Навсегда закрепляем пользователя за блогером
+        query_db(
+            "UPDATE users SET referred_by_blogger = ? WHERE user_id = ?",
+            (blogger_tag, user_id)
+        )
+
+        activate_plan(user_id, plan_key, "blogger_promo", 0.0, "BLOGGER")
+        u = get_user_data(user_id)
+
+        # Уведомляем админа о новом привлеченном пользователе
+        asyncio.create_task(
+            bot.send_message(
+                ADMIN_USER_ID,
+                f"📢 <b>Новый реферал от блогера!</b>\n\n"
+                f"👤 Блогер: <b>{html.escape(str(blogger_tag))}</b>\n"
+                f"🆔 Пользователь: <code>{user_id}</code>\n"
+                f"📦 Выдан бонус: <b>{html.escape(plan['title'])}</b>\n\n"
+                f"Теперь при любых покупках этого пользователя блогер будет получать 20%!",
+                parse_mode="HTML"
+            )
+        )
+
+        success_text = (
+            f"🎉 <b>Промокод от {html.escape(str(blogger_tag))} активирован!</b>\n\n"
+            f"Вам начислен тариф: <b>{html.escape(plan['title'])}</b>.\n"
+            f"📊 Ваш баланс: <b>{html.escape(u['status_text'])}</b>.\n\n"
+            "Приятного пользования!"
+        )
+        return True, success_text
 
     promo = rows[0]
     if int(promo.get("is_used") or 0) == 1:
@@ -977,7 +1102,171 @@ async def apply_promo_code_logic(user_id: int, raw_code: str) -> tuple[bool, str
     )
     return True, success_text
 
-@dp.message(Command("promo"))
+def generate_random_promo_code() -> str:
+    chars = string.ascii_uppercase + string.digits
+    part1 = "".join(secrets.choice(chars) for _ in range(4))
+    part2 = "".join(secrets.choice(chars) for _ in range(4))
+    return f"CRIM-{part1}-{part2}"
+
+def generate_blogger_promo_code(blogger_prefix: str) -> str:
+    clean_prefix = re.sub(r"[^A-Za-z0-9]", "", blogger_prefix).upper()[:5]
+    if not clean_prefix:
+        clean_prefix = "BLOG"
+    chars = string.ascii_uppercase + string.digits
+    random_part = "".join(secrets.choice(chars) for _ in range(4))
+    return f"{clean_prefix}-{random_part}"
+
+def get_admin_blogger_plans_keyboard():
+    buttons = []
+    for plan_key, plan in PLANS.items():
+        buttons.append([InlineKeyboardButton(text=f"🎁 {plan['title']}", callback_data=f"blog_plan:{plan_key}")])
+    buttons.append([InlineKeyboardButton(text="📊 Список блогеров и статистика (20%)", callback_data="blog_stats")])
+    buttons.append([InlineKeyboardButton(text="◀️ В меню", callback_data="back_to_main")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+@dp.message(Command("promoblog"))
+async def cmd_promoblog(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_USER_ID:
+        await message.answer("⛔ Данная команда доступна только главному администратору.")
+        return
+
+    await state.clear()
+    text = (
+        "🤝 <b>Панель работы с блогерами и инфлюенсерами</b>\n\n"
+        "Здесь вы можете создать партнерский промокод для блогера:\n"
+        "• Промокод многоразовый — каждый зритель блогера сможет ввести его 1 раз\n"
+        "• Зритель получает выбранный бонус (например, 7 дней безлимита)\n"
+        "• Зритель <b>навсегда закрепляется</b> за этим блогером\n"
+        "• Блогеру автоматически начисляется <b>20%</b> со всех будущих покупок его зрителей\n\n"
+        "Выберите тариф-бонус, который получит аудитория блогера 👇"
+    )
+    await message.answer(text, parse_mode="HTML", reply_markup=get_admin_blogger_plans_keyboard())
+
+@dp.callback_query(F.data.startswith("blog_plan:"))
+async def cb_select_blogger_plan(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    if callback.from_user.id != ADMIN_USER_ID:
+        return
+
+    plan_key = callback.data.split(":")[1]
+    plan = PLANS.get(plan_key)
+    if not plan:
+        return
+
+    await state.update_data(selected_blog_plan=plan_key)
+    await state.set_state(BloggerPromoFSM.waiting_for_blogger_tag)
+
+    cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ Отмена", callback_data="back_to_main")]
+    ])
+
+    await callback.message.edit_text(
+        f"📝 <b>Регистрация блогера</b>\n\n"
+        f"Выбранный бонус для зрителей: <b>{html.escape(plan['title'])}</b>\n\n"
+        "Отправьте в ответном сообщении <b>никнейм, имя или канал блогера</b>:\n"
+        "<i>Например: @resale_bro, Vlad Resale или TikTok_Artem</i>",
+        parse_mode="HTML",
+        reply_markup=cancel_kb
+    )
+
+@dp.message(StateFilter(BloggerPromoFSM.waiting_for_blogger_tag), F.text)
+async def process_blogger_tag_input(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_USER_ID:
+        return
+
+    blogger_tag = message.text.strip()
+    data = await state.get_data()
+    plan_key = data.get("selected_blog_plan", "sub_7d")
+    plan = PLANS.get(plan_key)
+    await state.clear()
+
+    # Проверяем, не зарегистрирован ли блогер с таким ником
+    existing = query_db("SELECT * FROM bloggers WHERE tag = ?", (blogger_tag,))
+    if existing:
+        b = existing[0]
+        await message.answer(
+            f"⚠️ Блогер <b>{html.escape(blogger_tag)}</b> уже зарегистрирован ранее!\n\n"
+            f"Его промокод: <code>{b['promo_code']}</code>\n"
+            f"Используйте команду <code>/promoblog</code> для просмотра статистики.",
+            parse_mode="HTML",
+            reply_markup=get_admin_blogger_plans_keyboard()
+        )
+        return
+
+    # Генерируем уникальный промокод для блогера
+    promo_code = generate_blogger_promo_code(blogger_tag)
+    now_iso = datetime.now().isoformat()
+
+    query_db(
+        """INSERT INTO bloggers (tag, promo_code, plan_id, created_at, earnings_uah, earnings_stars, total_referrals)
+           VALUES (?, ?, ?, ?, 0.0, 0, 0)""",
+        (blogger_tag, promo_code, plan_key, now_iso)
+    )
+
+    reply_text = (
+        "✅ <b>Блогер успешно зарегистрирован!</b>\n\n"
+        f"👤 Блогер: <b>{html.escape(blogger_tag)}</b>\n"
+        f"🎟 Промокод для видео: <code>{promo_code}</code> (нажмите, чтобы скопировать)\n"
+        f"🎁 Подарок для аудитории: <b>{html.escape(plan['title'])}</b>\n"
+        f"💸 Комиссия блогеру: <b>20%</b> со всех платежей его рефералов\n\n"
+        "Передайте этот промокод блогеру. Когда его зрители будут покупать тарифы, "
+        "бот будет автоматически присылать вам уведомления и подсчитывать баланс блогера."
+    )
+    await message.answer(reply_text, parse_mode="HTML", reply_markup=get_admin_blogger_plans_keyboard())
+
+@dp.callback_query(F.data == "blog_stats")
+async def cb_show_blogger_stats(callback: CallbackQuery):
+    await callback.answer()
+    if callback.from_user.id != ADMIN_USER_ID:
+        return
+
+    bloggers = query_db("SELECT * FROM bloggers ORDER BY id DESC")
+    if not bloggers:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Назад к тарифам", callback_data="back_to_blog_menu")]
+        ])
+        await callback.message.edit_text(
+            "📋 <b>Список блогеров пуст.</b>\n\nВы еще не зарегистрировали ни одного блогера.",
+            parse_mode="HTML",
+            reply_markup=kb
+        )
+        return
+
+    text_lines = ["📊 <b>Анкеты блогеров и начисления (20%):</b>\n"]
+    for idx, b in enumerate(bloggers, 1):
+        plan = PLANS.get(b.get("plan_id"), {})
+        plan_title = plan.get("title", "Бонус")
+        tag = html.escape(str(b.get("tag", "Блогер")))
+        code = b.get("promo_code", "НЕТ")
+        refs = b.get("total_referrals", 0)
+        uah = b.get("earnings_uah", 0.0)
+        stars = b.get("earnings_stars", 0)
+
+        text_lines.append(
+            f"<b>{idx}. {tag}</b>\n"
+            f"• Промокод: <code>{code}</code>\n"
+            f"• Привлечено людей: <b>{refs} чел.</b>\n"
+            f"• Бонус зрителям: {plan_title}\n"
+            f"• 💰 Заработано (20%): <b>{uah:.2f} грн</b> | <b>{stars} ⭐</b>\n"
+            "───────────────"
+        )
+
+    text_lines.append("\n<i>Вы можете в любой момент перевести блогеру указанную сумму вручную.</i>")
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Обновить список", callback_data="blog_stats")],
+        [InlineKeyboardButton(text="➕ Зарегистрировать еще блогера", callback_data="back_to_blog_menu")],
+        [InlineKeyboardButton(text="◀️ В главное меню", callback_data="back_to_main")]
+    ])
+
+    await callback.message.edit_text("\n".join(text_lines), parse_mode="HTML", reply_markup=kb)
+
+@dp.callback_query(F.data == "back_to_blog_menu")
+async def cb_back_to_blog_menu(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.clear()
+    await cmd_promoblog(callback.message, state)
+
 async def cmd_promo(message: Message):
     if message.from_user.id != ADMIN_USER_ID:
         parts = message.text.split(maxsplit=1)
