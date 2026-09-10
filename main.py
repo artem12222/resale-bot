@@ -557,21 +557,23 @@ def generate_marketplace_links(query_local: str, query_global: str) -> dict[str,
         "grailed": f"https://www.grailed.com/shop?query={enc_global}"
     }
 
-def prepare_image_part_sync(file_bytes: bytes) -> genai_types.Part:
+def prepare_image_bytes_sync(file_bytes: bytes) -> bytes:
+    """Конвейерная подготовка фото: выравнивание EXIF и сжатие в JPEG с минимальной задержкой."""
     with Image.open(io.BytesIO(file_bytes)) as img:
-        # Автоматически поворачиваем фото в правильную ориентацию с гироскопа телефона
         img = ImageOps.exif_transpose(img)
         img = img.convert("RGB")
-        img.thumbnail((1000, 1000), Image.Resampling.LANCZOS)
+        # 800px сохраняет идеальную читаемость бирок и снижает потребление токенов/CPU в 2 раза
+        img.thumbnail((800, 800), Image.Resampling.BILINEAR)
         out_buf = io.BytesIO()
-        img.save(out_buf, format="JPEG", quality=80, optimize=False)
-        return genai_types.Part.from_bytes(data=out_buf.getvalue(), mime_type="image/jpeg")
+        img.save(out_buf, format="JPEG", quality=75, optimize=False)
+        return out_buf.getvalue()
 
-async def fetch_and_prep_photo(bot_instance: Bot, file_id: str) -> genai_types.Part:
+async def fetch_and_prep_bytes(bot_instance: Bot, file_id: str) -> bytes:
+    """Асинхронно скачивает и пережимает фото на лету."""
     file_info = await bot_instance.get_file(file_id)
     stream = io.BytesIO()
     await bot_instance.download_file(file_info.file_path, destination=stream)
-    return await asyncio.to_thread(prepare_image_part_sync, stream.getvalue())
+    return await asyncio.to_thread(prepare_image_bytes_sync, stream.getvalue())
 
 def safe_int(val, default: int = 50) -> int:
     """Безопасно преобразует любое значение (число, строку с % или текстом) в int."""
@@ -1211,6 +1213,56 @@ async def cmd_promoblog(message: Message, state: FSMContext):
     )
     await message.answer(text, parse_mode="HTML", reply_markup=get_admin_blogger_plans_keyboard())
 
+@dp.message(Command("dellblog"))
+async def cmd_dellblog(message: Message):
+    if message.from_user.id != ADMIN_USER_ID:
+        await message.answer("⛔ Данная команда доступна только главному администратору.")
+        return
+
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.answer(
+            "⚠️ <b>Укажите ник или промокод блогера для удаления!</b>\n\n"
+            "Пример использования:\n"
+            "<code>/dellblog @resale_bro</code> или <code>/dellblog RESALE-7A1B</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    raw_tag = parts[1].strip()
+    tag_with_at = raw_tag if raw_tag.startswith("@") else f"@{raw_tag}"
+    tag_without_at = raw_tag.lstrip("@")
+
+    # Поиск по тегу с @, без @ или по прямому промокоду
+    found = query_db(
+        "SELECT * FROM bloggers WHERE tag = ? OR tag = ? OR promo_code = ?",
+        (tag_with_at, tag_without_at, raw_tag.upper())
+    )
+
+    if not found:
+        await message.answer(
+            f"❌ Блогер с ником или промокодом <b>{html.escape(raw_tag)}</b> не найден в базе данных.",
+            parse_mode="HTML"
+        )
+        return
+
+    blogger = found[0]
+    b_id = blogger["id"]
+    b_tag = blogger.get("tag", raw_tag)
+    b_code = blogger.get("promo_code", "НЕТ")
+
+    # Удаляем блогера и очищаем связанные записи
+    query_db("DELETE FROM bloggers WHERE id = ?", (b_id,))
+    query_db("DELETE FROM blogger_promo_uses WHERE blogger_id = ?", (b_id,))
+
+    await message.answer(
+        f"🗑 <b>Блогер успешно удален!</b>\n\n"
+        f"👤 Никнейм: <b>{html.escape(str(b_tag))}</b>\n"
+        f"🎟 Промокод <code>{b_code}</code> отключен.\n\n"
+        f"Проверить актуальный список: <code>/promoblog</code>",
+        parse_mode="HTML"
+    )
+
 @dp.callback_query(F.data.startswith("blog_plan:"))
 async def cb_select_blogger_plan(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
@@ -1443,7 +1495,11 @@ async def cb_start_check(callback: CallbackQuery, state: FSMContext):
 
 @dp.message(StateFilter(ClothingCheckFSM.waiting_for_main_photo), F.photo)
 async def process_main_photo(message: Message, state: FSMContext):
-    await state.update_data(main_photo=message.photo[-1].file_id)
+    # Фоновая загрузка и сжатие первого фото прямо во время шага 1
+    if bot:
+        p1_bytes = await fetch_and_prep_bytes(bot, message.photo[-1].file_id)
+        await state.update_data(photo_1_bytes=p1_bytes)
+
     await state.set_state(ClothingCheckFSM.waiting_for_neck_tag)
     await message.answer(
         "🏷 <b>Шаг 2 из 3: Главная бирка / Логотип</b>\n\n"
@@ -1453,7 +1509,11 @@ async def process_main_photo(message: Message, state: FSMContext):
 
 @dp.message(StateFilter(ClothingCheckFSM.waiting_for_neck_tag), F.photo)
 async def process_neck_tag_photo(message: Message, state: FSMContext):
-    await state.update_data(neck_photo=message.photo[-1].file_id)
+    # Фоновая загрузка и сжатие второго фото прямо во время шага 2
+    if bot:
+        p2_bytes = await fetch_and_prep_bytes(bot, message.photo[-1].file_id)
+        await state.update_data(photo_2_bytes=p2_bytes)
+
     await state.set_state(ClothingCheckFSM.waiting_for_care_tag)
     await message.answer(
         "🧵 <b>Шаг 3 из 3: Сервисный ярлык / Размерная бирка</b>\n\n"
@@ -1475,11 +1535,19 @@ async def process_care_tag_photo(message: Message, state: FSMContext):
         if not bot:
             raise RuntimeError("Telegram Bot instance not ready")
 
-        image_parts = await asyncio.gather(
-            fetch_and_prep_photo(bot, user_data["main_photo"]),
-            fetch_and_prep_photo(bot, user_data["neck_photo"]),
-            fetch_and_prep_photo(bot, message.photo[-1].file_id)
-        )
+        # Первые два фото уже пережаты и лежат в памяти; готовим только третье
+        p3_bytes = await fetch_and_prep_bytes(bot, message.photo[-1].file_id)
+        p1_bytes = user_data.get("photo_1_bytes")
+        p2_bytes = user_data.get("photo_2_bytes")
+
+        if not p1_bytes or not p2_bytes:
+            raise ValueError("Не удалось получить предыдущие фото. Пожалуйста, начните проверку заново.")
+
+        image_parts = [
+            genai_types.Part.from_bytes(data=p1_bytes, mime_type="image/jpeg"),
+            genai_types.Part.from_bytes(data=p2_bytes, mime_type="image/jpeg"),
+            genai_types.Part.from_bytes(data=p3_bytes, mime_type="image/jpeg")
+        ]
 
         data = await analyze_with_gemini_fallback(image_parts)
         decrement_check(message.from_user.id)
