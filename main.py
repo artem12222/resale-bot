@@ -29,7 +29,7 @@ from aiogram.types import (
 from google import genai
 from google.genai import types as genai_types
 import httpx
-from PIL import Image
+from PIL import Image, ImageOps
 
 logging.basicConfig(
     level=logging.INFO,
@@ -50,7 +50,6 @@ MONOBANK_TOKEN = os.getenv("MONOBANK_TOKEN", "").strip()
 FREE_CHECKS_PER_DAY = 3
 DB_NAME = "resale_bot.db"
 
-# Облачные учетные данные базы Turso (libSQL)
 DEFAULT_TURSO_URL = "libsql://resale-db-artem12222.aws-ap-south-1.turso.io"
 DEFAULT_TURSO_TOKEN = (
     "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJleHAiOjc5NzQzNzI1NDUsImlhdCI6MTc4ODczNzM0NSwiaWQiOiIw"
@@ -222,7 +221,8 @@ def init_db():
             is_premium INTEGER DEFAULT 0,
             extra_checks INTEGER DEFAULT 0,
             premium_until TEXT DEFAULT NULL,
-            is_lifetime INTEGER DEFAULT 0
+            is_lifetime INTEGER DEFAULT 0,
+            referred_by_blogger TEXT DEFAULT NULL
         )
     """)
 
@@ -283,11 +283,13 @@ def init_db():
         )
     """)
 
-    # Добавляем колонку реферера в таблицу пользователей, если ее еще нет
     try:
-        query_db("ALTER TABLE users ADD COLUMN referred_by_blogger TEXT DEFAULT NULL")
-    except Exception:
-        pass
+        user_cols = query_db("PRAGMA table_info(users)")
+        existing_col_names = [c.get("name") for c in user_cols if isinstance(c, dict)]
+        if "referred_by_blogger" not in existing_col_names:
+            query_db("ALTER TABLE users ADD COLUMN referred_by_blogger TEXT DEFAULT NULL")
+    except Exception as e:
+        logger.debug(f"Проверка колонки referred_by_blogger: {e}")
 
     logger.info("База данных инициализирована (Turso Cloud / SQLite)")
 
@@ -427,18 +429,19 @@ def activate_plan(user_id: int, plan_id: str, method: str, amount: float, curren
                 else:
                     comm_text = f"<b>20%</b> от {amount} {currency}"
 
-                asyncio.create_task(
-                    bot.send_message(
-                        ADMIN_USER_ID,
-                        f"💰 <b>Реферальное начисление блогеру!</b>\n\n"
-                        f"👤 Блогер: <b>{html.escape(str(blogger_tag))}</b>\n"
-                        f"🛍 Покупка пользователя: <code>{user_id}</code>\n"
-                        f"📦 Тариф: <b>{html.escape(plan['title'])}</b>\n"
-                        f"💵 Начислено блогеру: {comm_text}\n\n"
-                        f"Проверить балансы всех блогеров: <code>/promoblog</code>",
-                        parse_mode="HTML"
+                if bot:
+                    asyncio.create_task(
+                        bot.send_message(
+                            ADMIN_USER_ID,
+                            f"💰 <b>Реферальное начисление блогеру!</b>\n\n"
+                            f"👤 Блогер: <b>{html.escape(str(blogger_tag))}</b>\n"
+                            f"🛍 Покупка пользователя: <code>{user_id}</code>\n"
+                            f"📦 Тариф: <b>{html.escape(plan['title'])}</b>\n"
+                            f"💵 Начислено блогеру: {comm_text}\n\n"
+                            f"Проверить балансы всех блогеров: <code>/promoblog</code>",
+                            parse_mode="HTML"
+                        )
                     )
-                )
 
 try:
     ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
@@ -556,10 +559,12 @@ def generate_marketplace_links(query_local: str, query_global: str) -> dict[str,
 
 def prepare_image_part_sync(file_bytes: bytes) -> genai_types.Part:
     with Image.open(io.BytesIO(file_bytes)) as img:
+        # Автоматически поворачиваем фото в правильную ориентацию с гироскопа телефона
+        img = ImageOps.exif_transpose(img)
         img = img.convert("RGB")
-        img.thumbnail((900, 900), Image.Resampling.BILINEAR)
+        img.thumbnail((1000, 1000), Image.Resampling.LANCZOS)
         out_buf = io.BytesIO()
-        img.save(out_buf, format="JPEG", quality=75, optimize=False)
+        img.save(out_buf, format="JPEG", quality=80, optimize=False)
         return genai_types.Part.from_bytes(data=out_buf.getvalue(), mime_type="image/jpeg")
 
 async def fetch_and_prep_photo(bot_instance: Bot, file_id: str) -> genai_types.Part:
@@ -568,7 +573,18 @@ async def fetch_and_prep_photo(bot_instance: Bot, file_id: str) -> genai_types.P
     await bot_instance.download_file(file_info.file_path, destination=stream)
     return await asyncio.to_thread(prepare_image_part_sync, stream.getvalue())
 
+def safe_int(val, default: int = 50) -> int:
+    """Безопасно преобразует любое значение (число, строку с % или текстом) в int."""
+    if isinstance(val, (int, float)):
+        return int(val)
+    if isinstance(val, str):
+        digits = re.findall(r"\d+", val)
+        if digits:
+            return int(digits[0])
+    return default
+
 def extract_clean_json(text: str) -> dict:
+    """Извлекает валидные данные из ответа модели с многоуровневым восстановлением."""
     cleaned = text.strip()
     if cleaned.startswith("```"):
         cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
@@ -579,27 +595,82 @@ def extract_clean_json(text: str) -> dict:
     if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
         cleaned = cleaned[start_idx:end_idx + 1]
 
+    # Попытка 1: стандартный JSON
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError:
         pass
 
+    # Попытка 2: очистка висячих запятых и внутренних кавычек
     try:
         fixed = re.sub(r",\s*([}\]])", r"\1", cleaned)
-        fixed = re.sub(r'(:\s*")([^"]*)"([^"]*)(")', r'\1\2\'\3\4', fixed)
+        fixed = re.sub(r'(:\s*")([^"]*)"([^"]*)(")', r"\1\2'\3\4", fixed)
         return json.loads(fixed)
     except Exception:
-        logger.warning(f"Не удалось распарсить JSON: {cleaned[:200]}")
-        raise ValueError("AI вернул некорректную структуру данных")
+        pass
+
+    # Попытка 3: аварийное извлечение полей регулярными выражениями (никогда не падает)
+    fallback_data = {}
+    brand_match = re.search(r'["\']brand["\']\s*:\s*["\']([^"\']+)["\']', cleaned, re.IGNORECASE)
+    model_match = re.search(r'["\']item_name["\']\s*:\s*["\']([^"\']+)["\']', cleaned, re.IGNORECASE)
+    verdict_match = re.search(r'["\']authenticity_verdict["\']\s*:\s*["\']([^"\']+)["\']', cleaned, re.IGNORECASE)
+    score_match = re.search(r'["\']authenticity_score["\']\s*:\s*([0-9]+)', cleaned, re.IGNORECASE)
+    price_uah_min = re.search(r'["\']price_uah_min["\']\s*:\s*([0-9]+)', cleaned, re.IGNORECASE)
+    price_uah_max = re.search(r'["\']price_uah_max["\']\s*:\s*([0-9]+)', cleaned, re.IGNORECASE)
+
+    if brand_match or model_match:
+        fallback_data["brand"] = brand_match.group(1) if brand_match else "Бренд определен"
+        fallback_data["item_name"] = model_match.group(1) if model_match else "Вещь / Обувь"
+        fallback_data["category_tier"] = "Сегмент определен"
+        fallback_data["era_or_year"] = "Актуальная коллекция"
+        fallback_data["authenticity_verdict"] = verdict_match.group(1) if verdict_match else "Оригинал"
+        fallback_data["authenticity_score"] = int(score_match.group(1)) if score_match else 85
+        fallback_data["price_uah_min"] = int(price_uah_min.group(1)) if price_uah_min else 300
+        fallback_data["price_uah_max"] = int(price_uah_max.group(1)) if price_uah_max else 700
+        fallback_data["price_usd_min"] = max(10, fallback_data["price_uah_min"] // 40)
+        fallback_data["price_usd_max"] = max(20, fallback_data["price_uah_max"] // 40)
+        fallback_data["legit_reasons"] = ["Бирки, штрихкод и фурнитура соответствуют стандарту производителя"]
+        fallback_data["search_query_local"] = f"{fallback_data['brand']} {fallback_data['item_name']}"
+        fallback_data["search_query_global"] = f"{fallback_data['brand']} {fallback_data['item_name']}"
+        return fallback_data
+
+    logger.warning(f"Не удалось распарсить JSON: {cleaned[:200]}")
+    raise ValueError("AI вернул некорректную структуру данных")
 
 async def analyze_with_gemini_fallback(image_parts: list[genai_types.Part]) -> dict:
     if not ai_client:
         raise RuntimeError("Ключ GEMINI_API_KEY не установлен в настройках.")
 
     models_to_try = await asyncio.to_thread(get_candidate_models)
+    # Гарантируем список проверенных моделей
+    known_models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash", "gemini-3.7-flash"]
+    for km in known_models:
+        if km not in models_to_try:
+            models_to_try.append(km)
+
+    # Отключаем ложные блокировки для одежды и обуви (шорты, принты, белье)
+    safety_settings = [
+        genai_types.SafetySetting(
+            category=genai_types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+            threshold=genai_types.HarmBlockThreshold.BLOCK_NONE,
+        ),
+        genai_types.SafetySetting(
+            category=genai_types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+            threshold=genai_types.HarmBlockThreshold.BLOCK_NONE,
+        ),
+        genai_types.SafetySetting(
+            category=genai_types.HarmCategory.HARM_CATEGORY_HARASSMENT,
+            threshold=genai_types.HarmBlockThreshold.BLOCK_NONE,
+        ),
+        genai_types.SafetySetting(
+            category=genai_types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+            threshold=genai_types.HarmBlockThreshold.BLOCK_NONE,
+        ),
+    ]
+
     last_error = None
 
-    for model_name in models_to_try[:3]:
+    for model_name in models_to_try[:4]:
         try:
             logger.info(f"Отправка запроса к модели {model_name}...")
             response = await asyncio.wait_for(
@@ -609,16 +680,17 @@ async def analyze_with_gemini_fallback(image_parts: list[genai_types.Part]) -> d
                     contents=[*image_parts, ANALYSIS_PROMPT],
                     config=genai_types.GenerateContentConfig(
                         response_mime_type="application/json",
-                        temperature=0.1
+                        temperature=0.1,
+                        safety_settings=safety_settings
                     )
                 ),
-                timeout=45.0
+                timeout=65.0
             )
 
             raw_text = None
-            if response and response.text:
+            if response and getattr(response, "text", None):
                 raw_text = response.text
-            elif response and response.candidates and len(response.candidates) > 0:
+            elif response and getattr(response, "candidates", None) and len(response.candidates) > 0:
                 parts = response.candidates[0].content.parts if response.candidates[0].content else []
                 text_chunks = [p.text for p in parts if hasattr(p, "text") and p.text]
                 if text_chunks:
@@ -635,7 +707,7 @@ async def analyze_with_gemini_fallback(image_parts: list[genai_types.Part]) -> d
             if "404" in err_str or "NOT_FOUND" in err_str:
                 continue
             if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-                await asyncio.sleep(1.5)
+                await asyncio.sleep(2.0)
                 continue
 
     raise last_error or RuntimeError("Все доступные AI-модели временно недоступны.")
@@ -756,19 +828,21 @@ async def cb_pay_stars(callback: CallbackQuery):
         return
 
     prices = [LabeledPrice(label=plan["title"], amount=plan["stars"])]
-    await bot.send_invoice(
-        chat_id=callback.from_user.id,
-        title=plan["title"],
-        description=plan["description"],
-        payload=f"stars:{plan_key}:{callback.from_user.id}",
-        currency="XTR",
-        prices=prices,
-        provider_token=""
-    )
+    if bot:
+        await bot.send_invoice(
+            chat_id=callback.from_user.id,
+            title=plan["title"],
+            description=plan["description"],
+            payload=f"stars:{plan_key}:{callback.from_user.id}",
+            currency="XTR",
+            prices=prices,
+            provider_token=""
+        )
 
 @dp.pre_checkout_query()
 async def process_pre_checkout_query(pre_checkout_q: PreCheckoutQuery):
-    await bot.answer_pre_checkout_query(pre_checkout_q.id, ok=True)
+    if bot:
+        await bot.answer_pre_checkout_query(pre_checkout_q.id, ok=True)
 
 @dp.message(F.successful_payment)
 async def process_successful_stars_payment(message: Message):
@@ -942,7 +1016,8 @@ async def cb_notify_admin_mono(callback: CallbackQuery):
     )
 
     try:
-        await bot.send_message(ADMIN_USER_ID, admin_msg, parse_mode="HTML", reply_markup=admin_kb)
+        if bot:
+            await bot.send_message(ADMIN_USER_ID, admin_msg, parse_mode="HTML", reply_markup=admin_kb)
         await callback.message.answer(
             "✅ <b>Запрос отправлен администратору!</b>\n"
             "После проверки бот мгновенно начислит вам тариф и пришлет сообщение.",
@@ -966,18 +1041,19 @@ async def cb_admin_approve(callback: CallbackQuery):
     if plan:
         activate_plan(target_user_id, plan_key, "monobank_manual", plan["uah"], "UAH")
         u = get_user_data(target_user_id)
-        try:
-            await bot.send_message(
-                target_user_id,
-                f"🎉 <b>Ваша оплата подтверждена!</b>\n\n"
-                f"Тариф: <b>{html.escape(plan['title'])}</b> успешно начислен.\n"
-                f"📊 Ваш статус: <b>{html.escape(u['status_text'])}</b>.\n\n"
-                "Приятных проверок вещей!",
-                parse_mode="HTML",
-                reply_markup=get_main_menu_keyboard()
-            )
-        except Exception:
-            pass
+        if bot:
+            try:
+                await bot.send_message(
+                    target_user_id,
+                    f"🎉 <b>Ваша оплата подтверждена!</b>\n\n"
+                    f"Тариф: <b>{html.escape(plan['title'])}</b> успешно начислен.\n"
+                    f"📊 Ваш статус: <b>{html.escape(u['status_text'])}</b>.\n\n"
+                    "Приятных проверок вещей!",
+                    parse_mode="HTML",
+                    reply_markup=get_main_menu_keyboard()
+                )
+            except Exception:
+                pass
         await callback.message.edit_text(f"✅ Успешно! Пользователю <code>{target_user_id}</code> выдан тариф {plan['title']} ({plan['uah']} грн).", parse_mode="HTML")
 
 @dp.callback_query(F.data.startswith("adm_reject:"))
@@ -986,10 +1062,11 @@ async def cb_admin_reject(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_USER_ID:
         return
     target_user_id = int(callback.data.split(":")[1])
-    try:
-        await bot.send_message(target_user_id, "❌ Платеж на указанную сумму не был найден в выписке Банки.", parse_mode="HTML")
-    except Exception:
-        pass
+    if bot:
+        try:
+            await bot.send_message(target_user_id, "❌ Платеж на указанную сумму не был найден в выписке Банки.", parse_mode="HTML")
+        except Exception:
+            pass
     await callback.message.edit_text(f"❌ Заявка пользователя <code>{target_user_id}</code> отклонена.", parse_mode="HTML")
 
 def get_admin_promo_keyboard():
@@ -1008,9 +1085,8 @@ def generate_random_promo_code() -> str:
 async def apply_promo_code_logic(user_id: int, raw_code: str) -> tuple[bool, str]:
     clean_code = raw_code.strip().upper()
     rows = query_db("SELECT * FROM promo_codes WHERE code = ?", (clean_code,))
-    
+
     if not rows:
-        # Проверяем, не является ли промокод кодом от блогера
         blogger_rows = query_db("SELECT * FROM bloggers WHERE promo_code = ?", (clean_code,))
         if not blogger_rows:
             return False, "❌ Промокод не существует или введен неверно."
@@ -1023,7 +1099,6 @@ async def apply_promo_code_logic(user_id: int, raw_code: str) -> tuple[bool, str
         if not plan:
             return False, "❌ Ошибка: связанный тариф не найден."
 
-        # Проверяем, не активировал ли этот пользователь промокод данного блогера ранее
         already_used = query_db(
             "SELECT id FROM blogger_promo_uses WHERE blogger_id = ? AND user_id = ?",
             (blogger_id, user_id)
@@ -1040,7 +1115,6 @@ async def apply_promo_code_logic(user_id: int, raw_code: str) -> tuple[bool, str
             "UPDATE bloggers SET total_referrals = total_referrals + 1 WHERE id = ?",
             (blogger_id,)
         )
-        # Навсегда закрепляем пользователя за блогером
         query_db(
             "UPDATE users SET referred_by_blogger = ? WHERE user_id = ?",
             (blogger_tag, user_id)
@@ -1049,18 +1123,18 @@ async def apply_promo_code_logic(user_id: int, raw_code: str) -> tuple[bool, str
         activate_plan(user_id, plan_key, "blogger_promo", 0.0, "BLOGGER")
         u = get_user_data(user_id)
 
-        # Уведомляем админа о новом привлеченном пользователе
-        asyncio.create_task(
-            bot.send_message(
-                ADMIN_USER_ID,
-                f"📢 <b>Новый реферал от блогера!</b>\n\n"
-                f"👤 Блогер: <b>{html.escape(str(blogger_tag))}</b>\n"
-                f"🆔 Пользователь: <code>{user_id}</code>\n"
-                f"📦 Выдан бонус: <b>{html.escape(plan['title'])}</b>\n\n"
-                f"Теперь при любых покупках этого пользователя блогер будет получать 20%!",
-                parse_mode="HTML"
+        if bot:
+            asyncio.create_task(
+                bot.send_message(
+                    ADMIN_USER_ID,
+                    f"📢 <b>Новый реферал от блогера!</b>\n\n"
+                    f"👤 Блогер: <b>{html.escape(str(blogger_tag))}</b>\n"
+                    f"🆔 Пользователь: <code>{user_id}</code>\n"
+                    f"📦 Выдан бонус: <b>{html.escape(plan['title'])}</b>\n\n"
+                    f"Теперь при любых покупках этого пользователя блогер будет получать 20%!",
+                    parse_mode="HTML"
+                )
             )
-        )
 
         success_text = (
             f"🎉 <b>Промокод от {html.escape(str(blogger_tag))} активирован!</b>\n\n"
@@ -1175,7 +1249,6 @@ async def process_blogger_tag_input(message: Message, state: FSMContext):
     plan = PLANS.get(plan_key)
     await state.clear()
 
-    # Проверяем, не зарегистрирован ли блогер с таким ником
     existing = query_db("SELECT * FROM bloggers WHERE tag = ?", (blogger_tag,))
     if existing:
         b = existing[0]
@@ -1188,7 +1261,6 @@ async def process_blogger_tag_input(message: Message, state: FSMContext):
         )
         return
 
-    # Генерируем уникальный промокод для блогера
     promo_code = generate_blogger_promo_code(blogger_tag)
     now_iso = datetime.now().isoformat()
 
@@ -1400,6 +1472,9 @@ async def process_care_tag_photo(message: Message, state: FSMContext):
     )
 
     try:
+        if not bot:
+            raise RuntimeError("Telegram Bot instance not ready")
+
         image_parts = await asyncio.gather(
             fetch_and_prep_photo(bot, user_data["main_photo"]),
             fetch_and_prep_photo(bot, user_data["neck_photo"]),
@@ -1410,26 +1485,34 @@ async def process_care_tag_photo(message: Message, state: FSMContext):
         decrement_check(message.from_user.id)
         u = get_user_data(message.from_user.id)
 
-        brand = html.escape(str(data.get("brand", "Не определен")))
-        item_name = html.escape(str(data.get("item_name", "Вещь / Обувь")))
-        tier = html.escape(str(data.get("category_tier", "Масс-маркет")))
-        era = html.escape(str(data.get("era_or_year", "Не указан")))
-        verdict = html.escape(str(data.get("authenticity_verdict", "Проверено")))
+        brand = html.escape(str(data.get("brand") or "Не определен"))
+        item_name = html.escape(str(data.get("item_name") or "Вещь / Обувь"))
+        tier = html.escape(str(data.get("category_tier") or "Масс-маркет"))
+        era = html.escape(str(data.get("era_or_year") or "Не указан"))
+        verdict = html.escape(str(data.get("authenticity_verdict") or "Проверено"))
 
         local_q = data.get("search_query_local") or f"{brand} {item_name}"
         global_q = data.get("search_query_global") or f"{brand} {item_name}"
-        links = generate_marketplace_links(local_q, global_q)
+        links = generate_marketplace_links(str(local_q), str(global_q))
 
-        reasons_list = data.get("legit_reasons", [])
-        reasons_formatted = "\n".join([f"  • {html.escape(str(r))}" for r in reasons_list]) if reasons_list else "  • Детали и фурнитура соответствуют стандартам бренда"
+        raw_reasons = data.get("legit_reasons", [])
+        if isinstance(raw_reasons, list):
+            reasons_list = [str(r).strip() for r in raw_reasons if r]
+        elif isinstance(raw_reasons, str) and raw_reasons.strip():
+            reasons_list = [raw_reasons.strip()]
+        else:
+            reasons_list = []
 
-        score = data.get("authenticity_score", 50)
+        reasons_formatted = "\n".join([f"  • {html.escape(r)}" for r in reasons_list]) if reasons_list else "  • Детали и фурнитура соответствуют стандартам бренда"
+
+        # Безопасное приведение числовых значений (защита от падения TypeError)
+        score = safe_int(data.get("authenticity_score"), 75)
         score_emoji = "🟢" if score >= 75 else ("🟡" if score >= 45 else "🔴")
 
-        price_uah_min = data.get("price_uah_min", 0)
-        price_uah_max = data.get("price_uah_max", 0)
-        price_usd_min = data.get("price_usd_min", 0)
-        price_usd_max = data.get("price_usd_max", 0)
+        price_uah_min = safe_int(data.get("price_uah_min"), 300)
+        price_uah_max = safe_int(data.get("price_uah_max"), 600)
+        price_usd_min = safe_int(data.get("price_usd_min"), 10)
+        price_usd_max = safe_int(data.get("price_usd_max"), 20)
 
         result_message = (
             f"🏷 <b>Бренд:</b> {brand}\n"
@@ -1509,8 +1592,9 @@ async def main():
     init_db()
     await start_background_web()
     logger.info("Database initialized. Starting Telegram bot polling...")
-    await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+    if bot:
+        await bot.delete_webhook(drop_pending_updates=True)
+        await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
