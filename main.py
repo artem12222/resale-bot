@@ -1293,6 +1293,107 @@ async def cmd_dellblog(message: Message):
         parse_mode="HTML"
     )
 
+async def get_monobank_live_balance() -> tuple[Optional[float], str]:
+    """Получает текущий реальный баланс банки через Monobank API."""
+    if not MONOBANK_TOKEN:
+        return None, "API-токен банки не подключен"
+    try:
+        headers = {"X-Token": MONOBANK_TOKEN}
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            resp = await client.get("https://api.monobank.ua/personal/client-info", headers=headers)
+            if resp.status_code == 200:
+                data = resp.json()
+                jars = data.get("jars", [])
+                if jars:
+                    return float(jars[0].get("balance", 0)) / 100.0, ""
+                return 0.0, "Банки не найдены в аккаунте"
+            elif resp.status_code == 429:
+                return None, "Лимит запросов к Monobank (не чаще 1 раза в минуту)"
+            return None, f"Ответ банка: {resp.status_code}"
+    except Exception as e:
+        return None, f"Ошибка связи с банком: {e}"
+
+async def build_info_report_text() -> tuple[str, InlineKeyboardMarkup]:
+    """Собирает полную статистику по пользователям, банку и звездам."""
+    # 1. Метрики пользователей
+    total_users_rows = query_db("SELECT COUNT(*) as cnt FROM users")
+    total_users = total_users_rows[0].get("cnt", 0) if total_users_rows else 0
+
+    active_users_rows = query_db(
+        "SELECT COUNT(*) as cnt FROM users WHERE checks_today > 0 OR extra_checks > 0 OR is_lifetime = 1 OR (premium_until IS NOT NULL AND premium_until >= date('now'))"
+    )
+    active_users = active_users_rows[0].get("cnt", 0) if active_users_rows else 0
+
+    # 2. Выручка за всё время (Монобанк и Stars)
+    payment_stats = query_db("SELECT currency, SUM(amount) as total_sum, COUNT(*) as tx_count FROM payments WHERE status = 'success' GROUP BY currency")
+    total_uah_all_time = 0.0
+    total_stars_all_time = 0
+    total_successful_tx = 0
+
+    for row in payment_stats:
+        curr = str(row.get("currency") or "").upper()
+        s = float(row.get("total_sum") or 0)
+        c = int(row.get("tx_count") or 0)
+        total_successful_tx += c
+        if curr == "UAH":
+            total_uah_all_time = s
+        elif curr == "XTR":
+            total_stars_all_time = int(s)
+
+    paying_users_rows = query_db("SELECT COUNT(DISTINCT user_id) as cnt FROM payments WHERE status = 'success' AND amount > 0")
+    paying_users = paying_users_rows[0].get("cnt", 0) if paying_users_rows else 0
+
+    # 3. Текущий баланс на Монобанке в данное время
+    current_jar_balance, mono_err = await get_monobank_live_balance()
+    if current_jar_balance is not None:
+        mono_live_text = f"<b>{current_jar_balance:.2f} грн</b>"
+    else:
+        mono_live_text = f"<i>Недоступно ({html.escape(mono_err)})</i>"
+
+    text = (
+        "📊 <b>Аналитика и Финансы бота (/info)</b>\n\n"
+        "👥 <b>Пользователи:</b>\n"
+        f"• Всего зарегистрировано в боте: <b>{total_users} чел.</b>\n"
+        f"• Активно пользовались (проверяли вещи): <b>{active_users} чел.</b>\n"
+        f"• Платящих клиентов: <b>{paying_users} чел.</b>\n"
+        f"• Успешных покупок: <b>{total_successful_tx} шт.</b>\n\n"
+        "💳 <b>Монобанк (UAH):</b>\n"
+        f"• В данное время на Банке: {mono_live_text}\n"
+        f"• Заработано за всё время: <b>{total_uah_all_time:.2f} грн</b>\n\n"
+        "⭐ <b>Telegram Stars:</b>\n"
+        f"• Заработано звёзд за всё время: <b>{total_stars_all_time} ⭐</b>\n"
+        f"• Вывод звёзд в TON доступен на: <a href=\"https://fragment.com/stars\">Fragment.com/stars</a>\n\n"
+        f"🕒 <i>Данные обновлены: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}</i>"
+    )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Обновить показатели", callback_data="refresh_admin_info")],
+        [InlineKeyboardButton(text="◀️ В главное меню", callback_data="back_to_main")]
+    ])
+    return text, kb
+
+@dp.message(Command("info"))
+async def cmd_info(message: Message):
+    if message.from_user.id != ADMIN_USER_ID:
+        await message.answer("⛔ Данная команда доступна только главному администратору.")
+        return
+
+    text, kb = await build_info_report_text()
+    await message.answer(text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
+
+@dp.callback_query(F.data == "refresh_admin_info")
+async def cb_refresh_admin_info(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_USER_ID:
+        await callback.answer("⛔ Доступно только администратору.", show_alert=True)
+        return
+
+    await callback.answer("Запрашиваю актуальные данные...", show_alert=False)
+    text, kb = await build_info_report_text()
+    try:
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
+    except Exception:
+        pass
+
 @dp.callback_query(F.data.startswith("blog_plan:"))
 async def cb_select_blogger_plan(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
