@@ -465,13 +465,22 @@ def get_candidate_models() -> list[str]:
                 actions = getattr(m, "supported_actions", []) or getattr(m, "supported_generation_methods", [])
                 if actions and "generateContent" not in actions:
                     continue
-                if "flash" in name and "image" not in name and "live" not in name and "tts" not in name:
+                if "image" not in name and "live" not in name and "tts" not in name and "embedding" not in name:
                     discovered.append(name)
             logger.info(f"Обнаружены доступные модели Google AI: {discovered}")
         except Exception as e:
             logger.warning(f"Не удалось получить список моделей через API: {e}")
 
-    preferred = ["gemini-2.5-flash", "gemini-3.7-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-2.5-flash-lite"]
+    # Надежные модели на разных независимых кластерах GPU Google
+    preferred = [
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+        "gemini-1.5-flash",
+        "gemini-2.5-flash-lite",
+        "gemini-2.0-flash-lite",
+        "gemini-1.5-flash-8b",
+        "gemini-1.5-pro"
+    ]
     result = [m for m in preferred if m in discovered]
     for d in discovered:
         if d not in result:
@@ -644,13 +653,23 @@ async def analyze_with_gemini_fallback(image_parts: list[genai_types.Part]) -> d
         raise RuntimeError("Ключ GEMINI_API_KEY не установлен в настройках.")
 
     models_to_try = await asyncio.to_thread(get_candidate_models)
-    # Гарантируем список проверенных моделей
-    known_models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash", "gemini-3.7-flash"]
-    for km in known_models:
-        if km not in models_to_try:
-            models_to_try.append(km)
+    
+    # Резервная цепочка: если одна модель перегружена (503), сразу стучимся в соседний кластер
+    fallback_chain = [
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+        "gemini-1.5-flash",
+        "gemini-2.5-flash-lite",
+        "gemini-2.0-flash-lite",
+        "gemini-1.5-flash-8b",
+        "gemini-1.5-pro"
+    ]
+    combined_models = []
+    for m in models_to_try + fallback_chain:
+        if m not in combined_models:
+            combined_models.append(m)
 
-    # Отключаем ложные блокировки для одежды и обуви (шорты, принты, белье)
+    # Отключаем ложные блокировки для одежды и обуви
     safety_settings = [
         genai_types.SafetySetting(
             category=genai_types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
@@ -672,7 +691,7 @@ async def analyze_with_gemini_fallback(image_parts: list[genai_types.Part]) -> d
 
     last_error = None
 
-    for model_name in models_to_try[:4]:
+    for model_name in combined_models[:6]:
         try:
             logger.info(f"Отправка запроса к модели {model_name}...")
             response = await asyncio.wait_for(
@@ -686,7 +705,7 @@ async def analyze_with_gemini_fallback(image_parts: list[genai_types.Part]) -> d
                         safety_settings=safety_settings
                     )
                 ),
-                timeout=65.0
+                timeout=55.0
             )
 
             raw_text = None
@@ -706,8 +725,19 @@ async def analyze_with_gemini_fallback(image_parts: list[genai_types.Part]) -> d
             err_str = str(exc)
             logger.warning(f"Сбой модели {model_name}: {err_str}")
             last_error = exc
+            
+            # 404: модели нет в API Studio -> сразу переходим к следующей
             if "404" in err_str or "NOT_FOUND" in err_str:
                 continue
+
+            # 503 / UNAVAILABLE / high demand: конкретная модель временно перегружена Google
+            # Не ждем долго, а переключаемся на соседний независимый кластер (например с 2.5 на 2.0 или 1.5)
+            if "503" in err_str or "UNAVAILABLE" in err_str or "high demand" in err_str:
+                logger.info(f"Модель {model_name} перегружена у Google (503). Мгновенно переключаемся на резервную...")
+                await asyncio.sleep(1.0)
+                continue
+
+            # 429: минутный лимит запросов ключа
             if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
                 await asyncio.sleep(2.0)
                 continue
@@ -1627,7 +1657,9 @@ async def process_care_tag_photo(message: Message, state: FSMContext):
     except Exception as exc:
         err_msg = str(exc)
         logger.error(f"Ошибка при обработке запроса: {exc}", exc_info=True)
-        if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
+        if "503" in err_msg or "UNAVAILABLE" in err_msg or "high demand" in err_msg:
+            err_text = "⏳ Серверы Google AI сейчас испытывают пиковую мировую нагрузку. Пожалуйста, подождите 15-20 секунд и нажмите «🔍 Проверить вещь» снова."
+        elif "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
             err_text = "⏳ Превышен лимит запросов к AI в минуту. Пожалуйста, подождите 30 секунд и нажмите «🔍 Проверить вещь» снова."
         elif "404" in err_msg or "NOT_FOUND" in err_msg:
             err_text = f"⚠️ Модель AI временно недоступна для ключа: {html.escape(err_msg[:80])}."
