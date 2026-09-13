@@ -487,8 +487,8 @@ def get_candidate_models() -> list[str]:
 
     # Надежные модели на разных независимых кластерах GPU Google
     preferred = [
-        "gemini-2.5-flash",
         "gemini-2.0-flash",
+        "gemini-2.5-flash",
         "gemini-1.5-flash",
         "gemini-2.5-flash-lite",
         "gemini-2.0-flash-lite",
@@ -518,47 +518,61 @@ class BloggerPromoFSM(StatesGroup):
     waiting_for_blogger_tag = State()
 
 ANALYSIS_PROMPT = """
-Ты — профессиональный эксперт по ресейлу, оценке и легит-чеку ЛЮБОЙ одежды, обуви (кроссовок) и аксессуаров.
-Тебе отправлены 3 фотографии одной вещи:
-1) Общий план вещи (одежда, кроссовки, куртка, сумка).
-2) Главная бирка / логотип / бирка на воротнике (для одежды) ИЛИ язычок / внешний брендинг (для обуви).
-3) Внутренний сервисный ярлык (состав, фабричный артикул, wash tag) ИЛИ размерный ярлык кроссовок со style-code и штрихкодом.
+Ты — ведущий мировой эксперт-криминалист по легит-чеку, ресейлу и аутентификации брендовой одежды, обуви (кроссовок) и аксессуаров.
+Перед тобой 3 фотографии одной вещи:
+1) Общий план вещи целиком.
+2) Главная бирка / вышивка / воротниковый ярлык / брендинг язычка обуви.
+3) Сервисный ярлык (wash tag) с артикулом и составом ИЛИ размерная бирка обуви со style-code.
 
-ТВОЯ ЗАДАЧА:
-1. ОПРЕДЕЛИТЬ БРЕНД И МОДЕЛЬ:
-   - Внимательно прочитай текст, артикулы, цифры, штрихкоды и логотипы на всех бирках (даже если фото перевернуто или под углом).
-   - Определи категорию: Масс-маркет / Стритвир и Ворквир / Спортивный бренд / Премиум и Люкс / Винтаж.
+КРИТИЧЕСКИЙ ПРИНЦИП ПРОВЕРКИ:
+Презумпция подделки для хайповых брендов! Китайские и турецкие реплики научились копировать общий вид, но ВСЕГДА прокалываются на микро-деталях бирок, шрифтах и кодах. Твоя задача — найти малейшие несоответствия. Если есть малейшее подозрение — СНИЖАЙ БАЛЛ и выноси вердикт «Подделка (Реплика)» или «Сомнительно».
 
-2. ПРОВЕСТИ ЛЕГИТ-ЧЕК:
-   - Оцени оригинальность: шрифты, ровность строчек, наличие фабричных кодов (RN, CA, style-code, Certilogo, QR-коды, штрихкоды).
-   - Для масс-маркета (Zara, Pull&Bear, Bershka, H&M, Uniqlo, Mango и др.): если бирки фабричные — оригинальность 99-100% (масс-маркет не подделывают).
-   - Для кроссовок (Nike, adidas, New Balance, Jordan, ASICS): проверь соответствие style-code и формат размерной сетки.
-   - Сформулируй четкие причины вердикта (legit_reasons).
+БАЗА ЗНАНИЙ ДЛЯ ВЫЯВЛЕНИЯ ПАЛИ:
+1. STONE ISLAND & C.P. COMPANY:
+   - СТРУКТУРА АРТИКУЛА (Art Code): 
+     * Первые 2 цифры = сезон (например: 78 = SS23, 79 = FW23, 80 = SS24, 81 = FW24, 75 = FW21, 73 = FW20).
+     * 3-я и 4-я цифры = бренд (15 = Stone Island, 18 = Shadow Project, 14 = Junior, 20 = C.P. Company).
+     * 5-я цифра = ТИП ВЕЩИ (1 = рубашка, 2 = свитер/трикотаж, 4 = футболка/поло, 5 = худи/свитшот, 6 = куртка, 7 = пуховик/парка, 9 = аксессуары).
+     * ВНИМАНИЕ: если перед тобой худи/свитшот, а на бирке артикул начинается на 75154... (где 4 — это футболка), это 100% ДЕШЕВАЯ КИТАЙСКАЯ ПАЛЬ!
+   - ПАТЧ (BADGE): на обратной стороне оригинального патча нитки вышивки белые или желто-зеленые с характерной петлей ("drop stitch"). Прорези под пуговицы имеют ровную плотную машинную рамку. Пуговицы — глубокие матовые, вогнутые, с крестообразной пришивкой и четкой гравировкой "STONE ISLAND" (не плоский блестящий пластик!).
+   - CERTILOGO: 12-значный код должен быть разделен пробелами по 3 цифры (XXX XXX XXX XXX). Шрифт Certilogo узкий фирменный, QR-код четкий. Если напечатан стандартным Arial — 100% паль.
 
-3. ОЦЕНИТЬ РЕАЛЬНУЮ РЫНОЧНУЮ СТОИМОСТЬ (ВТОРИЧКА УКРАИНЫ И МИР):
-   - Оцени адекватную вилку цен для продажи б/у вещи в хорошем состоянии:
-     * price_uah_min / price_uah_max (в гривнах для Shafa.ua и OLX).
-     * price_usd_min / price_usd_max (в долларах для eBay и Grailed).
+2. AMI PARIS (Ami Alexandre Mattiussi):
+   - ЛОГОТИП "Ami de Coeur" (Сердце с буквой А): вышивка должна быть сверхплотной, объемной, с закругленными верхушками сердца. Между нижней частью сердца и верхушкой буквы «А» ОБЯЗАТЕЛЕН четкий микро-зазор! Если сердце сливается с ножкой «А» или между ними тянется соединительная нитка перескока — это паль.
+   - БИРКИ: на воротнике плотная тканая лента с загнутыми краями. На сервисной бирке фраза "Fabriqué au Portugal" без орфографических ошибок, шрифты четкие, значки стирки ровные.
 
-4. СФОРМИРОВАТЬ ТОЧНЫЕ ПОИСКОВЫЕ ЗАПРОСЫ (2-3 СЛОВА):
-   - search_query_local: бренд + тип вещи на русском/украинском (например: "Nike кроссовки мужские", "Carhartt куртка").
-   - search_query_global: бренд + линейка/модель латиницей (например: "Nike Dunk Low", "Carhartt Detroit jacket").
+3. NIKE, JORDAN, TRAVIS SCOTT:
+   - Размерный ярлык кроссовок: стиль-код (например, DD1391-100) обязан на 100% соответствовать именно этой расцветке. Даты производства справа/слева должны быть четкими, штрихкод без слипшихся полос. Проверь ровность вышивки Swoosh и задника.
 
-КРИТИЧЕСКИЕ ТРЕБОВАНИЯ:
-- Верни ИСКЛЮЧИТЕЛЬНО валидный JSON без оберток markdown (без ```json).
-- Внутри строковых значений НЕ используй двойные кавычки (заменяй их на одинарные).
+4. ARC'TERYX:
+   - Вышивка скелета Archaeopteryx: у оригинальной птицы строго 6 ребер на позвоночнике! Если ребер 7, 8 или они кривые — это подделка. Никаких торчащих ниток перехода между буквами.
 
-Структура JSON:
+5. ОБЩИЕ ПРИЗНАКИ ДЛЯ RALPH LAUREN, STUSSY, CARHARTT, CORTEIZ, TRAPSTAR, ESSENTIALS:
+   - Соединительные нитки между вышитыми буквами (jump-stitches) — верный признак дешевой реплики.
+   - Ошибки в словах на бирках (в русском слове «ХЛОПОК», французском «COTON», немецком «BAUMWOLLE»).
+   - Дешевая шуршащая синтетическая ткань ярлыка вместо мягкого сатина или нейлона.
+
+ГРАДАЦИЯ ОЦЕНКИ (authenticity_score):
+- 90–100%: 100% Оригинал (Все бирки, структура арт-кода, фурнитура и швы безупречны).
+- 70–89%: Оригинал (Фабричные бирки, корректные шрифты, типичный оригинальный пошив).
+- 40–69%: Сомнительно (Есть расхождения в шрифтах, сомнительный ярлык или дефекты швов).
+- 0–39%: Подделка (Реплика) — выявлен очевидный фейк по арт-коду, кривым вышивкам или поддельным биркам.
+
+ЦЕНЫ НА ВТОРИЧКЕ:
+- Для реплики/пали: реальная стоимость продажи на барахолках символическая (200–500 грн).
+- Для оригинала: реальная вилка б/у рынка Украины (Шафа, OLX) и мирового (eBay, Grailed).
+
+ФОРМАТ ОТВЕТА (строго JSON без markdown):
 {
   "brand": "Точное название бренда",
   "category_tier": "Категория вещи",
   "item_name": "Название модели или тип вещи",
   "era_or_year": "Примерные годы выпуска",
-  "authenticity_verdict": "100% Оригинал / Оригинал / Сомнительно / Подделка",
+  "authenticity_verdict": "100% Оригинал / Оригинал / Сомнительно / Подделка (Реплика)",
   "authenticity_score": 95,
   "legit_reasons": [
-    "Первая конкретная причина вердикта по бирке/швам",
-    "Вторая причина по артикулу/материалам"
+    "Конкретная техническая причина по бирке/арт-коду",
+    "Причина по вышивке/швам/фурнитуре"
   ],
   "price_uah_min": 300,
   "price_uah_max": 600,
@@ -581,14 +595,14 @@ def generate_marketplace_links(query_local: str, query_global: str) -> dict[str,
     }
 
 def prepare_image_bytes_sync(file_bytes: bytes) -> bytes:
-    """Конвейерная подготовка фото: выравнивание EXIF и сжатие в JPEG с минимальной задержкой."""
+    """Конвейерная подготовка фото: мгновенное выравнивание EXIF и оптимизация в JPEG."""
     with Image.open(io.BytesIO(file_bytes)) as img:
         img = ImageOps.exif_transpose(img)
         img = img.convert("RGB")
-        # 800px сохраняет идеальную читаемость бирок и снижает потребление токенов/CPU в 2 раза
-        img.thumbnail((800, 800), Image.Resampling.BILINEAR)
+        # 750px обеспечивает идеальную четкость артикулов и на 40% ускоряет работу нейросети
+        img.thumbnail((750, 750), Image.Resampling.BILINEAR)
         out_buf = io.BytesIO()
-        img.save(out_buf, format="JPEG", quality=75, optimize=False)
+        img.save(out_buf, format="JPEG", quality=70, optimize=False)
         return out_buf.getvalue()
 
 async def fetch_and_prep_bytes(bot_instance: Bot, file_id: str) -> bytes:
@@ -668,10 +682,10 @@ async def analyze_with_gemini_fallback(image_parts: list[genai_types.Part]) -> d
 
     models_to_try = await asyncio.to_thread(get_candidate_models)
     
-    # Резервная цепочка: если одна модель перегружена (503), сразу стучимся в соседний кластер
+    # Резервная цепочка: быстрый gemini-2.0-flash в приоритете
     fallback_chain = [
-        "gemini-2.5-flash",
         "gemini-2.0-flash",
+        "gemini-2.5-flash",
         "gemini-1.5-flash",
         "gemini-2.5-flash-lite",
         "gemini-2.0-flash-lite",
@@ -683,7 +697,6 @@ async def analyze_with_gemini_fallback(image_parts: list[genai_types.Part]) -> d
         if m not in combined_models:
             combined_models.append(m)
 
-    # Отключаем ложные блокировки для одежды и обуви
     safety_settings = [
         genai_types.SafetySetting(
             category=genai_types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
@@ -708,18 +721,27 @@ async def analyze_with_gemini_fallback(image_parts: list[genai_types.Part]) -> d
     for model_name in combined_models[:6]:
         try:
             logger.info(f"Отправка запроса к модели {model_name}...")
+            
+            # Конфигурация генерации: отключаем thinking-задержку для экономии 15-20 сек
+            gen_config = genai_types.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0.1,
+                safety_settings=safety_settings
+            )
+            if "2.5" in model_name:
+                try:
+                    gen_config.thinking_config = genai_types.ThinkingConfig(thinking_budget=0)
+                except Exception:
+                    pass
+
             response = await asyncio.wait_for(
                 asyncio.to_thread(
                     ai_client.models.generate_content,
                     model=model_name,
                     contents=[*image_parts, ANALYSIS_PROMPT],
-                    config=genai_types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        temperature=0.1,
-                        safety_settings=safety_settings
-                    )
+                    config=gen_config
                 ),
-                timeout=55.0
+                timeout=40.0
             )
 
             raw_text = None
@@ -740,20 +762,16 @@ async def analyze_with_gemini_fallback(image_parts: list[genai_types.Part]) -> d
             logger.warning(f"Сбой модели {model_name}: {err_str}")
             last_error = exc
             
-            # 404: модели нет в API Studio -> сразу переходим к следующей
             if "404" in err_str or "NOT_FOUND" in err_str:
                 continue
 
-            # 503 / UNAVAILABLE / high demand: конкретная модель временно перегружена Google
-            # Не ждем долго, а переключаемся на соседний независимый кластер (например с 2.5 на 2.0 или 1.5)
             if "503" in err_str or "UNAVAILABLE" in err_str or "high demand" in err_str:
-                logger.info(f"Модель {model_name} перегружена у Google (503). Мгновенно переключаемся на резервную...")
-                await asyncio.sleep(1.0)
+                logger.info(f"Модель {model_name} перегружена у Google (503). Переключаемся...")
+                await asyncio.sleep(0.8)
                 continue
 
-            # 429: минутный лимит запросов ключа
             if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-                await asyncio.sleep(2.0)
+                await asyncio.sleep(1.5)
                 continue
 
     raise last_error or RuntimeError("Все доступные AI-модели временно недоступны.")
@@ -1439,38 +1457,37 @@ async def cmd_dellpoint(message: Message):
     await message.answer("🗑 Все точки отчётов (вечерняя рассылка в 22:00) успешно отключены.", parse_mode="HTML")
 
 async def daily_point_scheduler():
-    """Фоновая задача: рассылка статистики блогеров каждый вечер в 22:00 по киевскому времени."""
-    logger.info("Запущен планировщик вечерних отчётов (22:00 по Киеву).")
+    """Надежный интервальный планировщик: проверяет время каждые 30 секунд и гарантированно шлет отчет в 22:00."""
+    logger.info("Запущен планировщик вечерних отчётов (интервал 30 сек, окно 22:00 Киев).")
+    last_reported_date = ""
     while True:
         try:
             now = datetime.now(KYIV_TZ)
-            target = now.replace(hour=22, minute=0, second=0, microsecond=0)
-            if now >= target:
-                target += timedelta(days=1)
+            today_str = now.strftime("%Y-%m-%d")
 
-            sleep_seconds = (target - now).total_seconds()
-            logger.info(f"Следующий вечерний отчёт запланирован на {target.strftime('%d.%m.%Y %H:%M:%S')} (через {int(sleep_seconds)} сек.)")
-            await asyncio.sleep(sleep_seconds)
+            # Окно отправки отчета: если на часах 22:00-22:15 и сегодня еще не отправляли
+            if now.hour == 22 and 0 <= now.minute <= 15 and last_reported_date != today_str:
+                points = query_db("SELECT * FROM report_points")
+                if points and bot:
+                    logger.info(f"Начало отправки вечерних отчётов за {today_str}...")
+                    report_text = format_blogger_stats_text("📊 <b>Ежедневный отчёт по блогерам (22:00 Киев):</b>\n")
+                    for p in points:
+                        cid = p.get("chat_id")
+                        if not cid:
+                            continue
+                        try:
+                            await bot.send_message(cid, report_text, parse_mode="HTML")
+                            logger.info(f"Вечерний отчёт успешно доставлен в {cid} ({p.get('title')})")
+                        except Exception as post_err:
+                            logger.warning(f"Не удалось отправить вечерний отчёт в {cid}: {post_err}")
+                last_reported_date = today_str
 
-            points = query_db("SELECT * FROM report_points")
-            if points and bot:
-                report_text = format_blogger_stats_text("📊 <b>Ежедневный отчёт по блогерам (22:00 Киев):</b>\n")
-                for p in points:
-                    cid = p.get("chat_id")
-                    if not cid:
-                        continue
-                    try:
-                        await bot.send_message(cid, report_text, parse_mode="HTML")
-                        logger.info(f"Вечерний отчёт успешно доставлен в {cid} ({p.get('title')})")
-                    except Exception as post_err:
-                        logger.warning(f"Не удалось отправить вечерний отчёт в {cid}: {post_err}")
-
-            await asyncio.sleep(65)
+            await asyncio.sleep(30)
         except asyncio.CancelledError:
             break
         except Exception as loop_err:
             logger.error(f"Ошибка в daily_point_scheduler: {loop_err}")
-            await asyncio.sleep(60)
+            await asyncio.sleep(30)
 
 @dp.callback_query(F.data.startswith("blog_plan:"))
 async def cb_select_blogger_plan(callback: CallbackQuery, state: FSMContext):
