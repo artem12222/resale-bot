@@ -1,5 +1,5 @@
 import asyncio
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 import html
 import io
 import json
@@ -11,6 +11,12 @@ import sqlite3
 import string
 from typing import Optional
 import urllib.parse
+
+try:
+    from zoneinfo import ZoneInfo
+    KYIV_TZ = ZoneInfo("Europe/Kyiv")
+except Exception:
+    KYIV_TZ = timezone(timedelta(hours=3))
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, types
@@ -280,6 +286,14 @@ def init_db():
             user_id INTEGER,
             used_at TEXT,
             UNIQUE(blogger_id, user_id)
+        )
+    """)
+
+    query_db("""
+        CREATE TABLE IF NOT EXISTS report_points (
+            chat_id TEXT PRIMARY KEY,
+            title TEXT,
+            created_at TEXT
         )
     """)
 
@@ -1293,106 +1307,170 @@ async def cmd_dellblog(message: Message):
         parse_mode="HTML"
     )
 
-async def get_monobank_live_balance() -> tuple[Optional[float], str]:
-    """Получает текущий реальный баланс банки через Monobank API."""
-    if not MONOBANK_TOKEN:
-        return None, "API-токен банки не подключен"
-    try:
-        headers = {"X-Token": MONOBANK_TOKEN}
-        async with httpx.AsyncClient(timeout=8.0) as client:
-            resp = await client.get("https://api.monobank.ua/personal/client-info", headers=headers)
-            if resp.status_code == 200:
-                data = resp.json()
-                jars = data.get("jars", [])
-                if jars:
-                    return float(jars[0].get("balance", 0)) / 100.0, ""
-                return 0.0, "Банки не найдены в аккаунте"
-            elif resp.status_code == 429:
-                return None, "Лимит запросов к Monobank (не чаще 1 раза в минуту)"
-            return None, f"Ответ банка: {resp.status_code}"
-    except Exception as e:
-        return None, f"Ошибка связи с банком: {e}"
+def format_blogger_stats_text(header: str = "📊 <b>Партнёрская статистика блогеров (20%):</b>\n") -> str:
+    """Форматирует полную сводку блогеров и начислений для отправки в каналы или админу."""
+    bloggers = query_db("SELECT * FROM bloggers ORDER BY id DESC")
+    if not bloggers:
+        return f"{header}\n<i>Блогеры пока не зарегистрированы в системе.</i>"
 
-async def build_info_report_text() -> tuple[str, InlineKeyboardMarkup]:
-    """Собирает полную статистику по пользователям, банку и звездам."""
-    # 1. Метрики пользователей
-    total_users_rows = query_db("SELECT COUNT(*) as cnt FROM users")
-    total_users = total_users_rows[0].get("cnt", 0) if total_users_rows else 0
+    text_lines = [header]
+    total_refs = 0
+    total_uah = 0.0
+    total_stars = 0
 
-    active_users_rows = query_db(
-        "SELECT COUNT(*) as cnt FROM users WHERE checks_today > 0 OR extra_checks > 0 OR is_lifetime = 1 OR (premium_until IS NOT NULL AND premium_until >= date('now'))"
+    for idx, b in enumerate(bloggers, 1):
+        plan = PLANS.get(b.get("plan_id"), {})
+        plan_title = plan.get("title", "Бонус")
+        tag = html.escape(str(b.get("tag", "Блогер")))
+        code = b.get("promo_code", "НЕТ")
+        refs = int(b.get("total_referrals") or 0)
+        uah = float(b.get("earnings_uah") or 0.0)
+        stars = int(b.get("earnings_stars") or 0)
+
+        total_refs += refs
+        total_uah += uah
+        total_stars += stars
+
+        text_lines.append(
+            f"<b>{idx}. {tag}</b>\n"
+            f"• Промокод: <code>{code}</code>\n"
+            f"• Привлечено: <b>{refs} чел.</b>\n"
+            f"• Бонус зрителям: {plan_title}\n"
+            f"• 💰 Заработано (20%): <b>{uah:.2f} грн</b> | <b>{stars} ⭐</b>\n"
+            "───────────────"
+        )
+
+    text_lines.append(
+        f"\n📈 <b>Итого по всем блогерам:</b>\n"
+        f"• Всего рефералов: <b>{total_refs} чел.</b>\n"
+        f"• К выплате суммарно: <b>{total_uah:.2f} грн</b> | <b>{total_stars} ⭐</b>\n\n"
+        f"🕒 <i>Сформировано: {datetime.now(KYIV_TZ).strftime('%d.%m.%Y %H:%M')} (Киев)</i>"
     )
-    active_users = active_users_rows[0].get("cnt", 0) if active_users_rows else 0
+    return "\n".join(text_lines)
 
-    # 2. Выручка за всё время (Монобанк и Stars)
-    payment_stats = query_db("SELECT currency, SUM(amount) as total_sum, COUNT(*) as tx_count FROM payments WHERE status = 'success' GROUP BY currency")
-    total_uah_all_time = 0.0
-    total_stars_all_time = 0
-    total_successful_tx = 0
-
-    for row in payment_stats:
-        curr = str(row.get("currency") or "").upper()
-        s = float(row.get("total_sum") or 0)
-        c = int(row.get("tx_count") or 0)
-        total_successful_tx += c
-        if curr == "UAH":
-            total_uah_all_time = s
-        elif curr == "XTR":
-            total_stars_all_time = int(s)
-
-    paying_users_rows = query_db("SELECT COUNT(DISTINCT user_id) as cnt FROM payments WHERE status = 'success' AND amount > 0")
-    paying_users = paying_users_rows[0].get("cnt", 0) if paying_users_rows else 0
-
-    # 3. Текущий баланс на Монобанке в данное время
-    current_jar_balance, mono_err = await get_monobank_live_balance()
-    if current_jar_balance is not None:
-        mono_live_text = f"<b>{current_jar_balance:.2f} грн</b>"
-    else:
-        mono_live_text = f"<i>Недоступно ({html.escape(mono_err)})</i>"
-
-    text = (
-        "📊 <b>Аналитика и Финансы бота (/info)</b>\n\n"
-        "👥 <b>Пользователи:</b>\n"
-        f"• Всего зарегистрировано в боте: <b>{total_users} чел.</b>\n"
-        f"• Активно пользовались (проверяли вещи): <b>{active_users} чел.</b>\n"
-        f"• Платящих клиентов: <b>{paying_users} чел.</b>\n"
-        f"• Успешных покупок: <b>{total_successful_tx} шт.</b>\n\n"
-        "💳 <b>Монобанк (UAH):</b>\n"
-        f"• В данное время на Банке: {mono_live_text}\n"
-        f"• Заработано за всё время: <b>{total_uah_all_time:.2f} грн</b>\n\n"
-        "⭐ <b>Telegram Stars:</b>\n"
-        f"• Заработано звёзд за всё время: <b>{total_stars_all_time} ⭐</b>\n"
-        f"• Вывод звёзд в TON доступен на: <a href=\"https://fragment.com/stars\">Fragment.com/stars</a>\n\n"
-        f"🕒 <i>Данные обновлены: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}</i>"
-    )
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Обновить показатели", callback_data="refresh_admin_info")],
-        [InlineKeyboardButton(text="◀️ В главное меню", callback_data="back_to_main")]
-    ])
-    return text, kb
-
-@dp.message(Command("info"))
-async def cmd_info(message: Message):
+@dp.message(Command("point"))
+async def cmd_point(message: Message):
     if message.from_user.id != ADMIN_USER_ID:
         await message.answer("⛔ Данная команда доступна только главному администратору.")
         return
 
-    text, kb = await build_info_report_text()
-    await message.answer(text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
+    parts = message.text.split(maxsplit=1)
+    target_chat = None
+    target_title = None
 
-@dp.callback_query(F.data == "refresh_admin_info")
-async def cb_refresh_admin_info(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_USER_ID:
-        await callback.answer("⛔ Доступно только администратору.", show_alert=True)
+    if len(parts) > 1 and parts[1].strip():
+        target_chat = parts[1].strip()
+    elif message.chat.type in ("group", "supergroup", "channel"):
+        target_chat = str(message.chat.id)
+        target_title = message.chat.title or "Группа"
+    else:
+        await message.answer(
+            "⚠️ <b>Укажите канал или группу для отчётов!</b>\n\n"
+            "Примеры использования:\n"
+            "• <code>/point @my_channel</code> — привязать публичный канал или группу\n"
+            "• <code>/point -1001234567890</code> — привязать по ID\n"
+            "• Или напишите <code>/point</code> прямо внутри группы, куда добавлен бот.",
+            parse_mode="HTML"
+        )
         return
 
-    await callback.answer("Запрашиваю актуальные данные...", show_alert=False)
-    text, kb = await build_info_report_text()
+    if not bot:
+        await message.answer("⚠️ Ошибка: Экземпляр бота не инициализирован.")
+        return
+
+    report_text = format_blogger_stats_text("📊 <b>Активация точки отчётов /point</b>\n\nСтатистика блогеров на данный момент:\n")
     try:
-        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
-    except Exception:
-        pass
+        sent_msg = await bot.send_message(target_chat, report_text, parse_mode="HTML")
+        final_chat_id = str(sent_msg.chat.id)
+        if not target_title:
+            target_title = sent_msg.chat.title or sent_msg.chat.username or str(target_chat)
+
+        now_iso = datetime.now().isoformat()
+        query_db("DELETE FROM report_points WHERE chat_id = ?", (final_chat_id,))
+        query_db(
+            "INSERT INTO report_points (chat_id, title, created_at) VALUES (?, ?, ?)",
+            (final_chat_id, target_title, now_iso)
+        )
+
+        await message.answer(
+            f"✅ <b>Точка отчётов успешно активирована!</b>\n\n"
+            f"📍 Канал / Чат: <b>{html.escape(target_title)}</b> (<code>{final_chat_id}</code>)\n"
+            f"📤 Тестовый отчёт со статистикой блогеров уже отправлен туда.\n"
+            f"⏰ <b>Авто-рассылка:</b> каждый вечер ровно в <b>22:00</b> по киевскому времени бот будет присылать туда свежую статистику.\n\n"
+            f"Для отключения используйте: <code>/dellpoint</code>",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.error(f"Ошибка активации точки {target_chat}: {e}")
+        await message.answer(
+            f"❌ <b>Не удалось отправить отчёт в {html.escape(str(target_chat))}!</b>\n\n"
+            f"Причина: <code>{html.escape(str(e))}</code>\n\n"
+            "Убедитесь, что:\n"
+            "1. Бот добавлен в эту группу/канал как администратор с правами публикации.\n"
+            "2. Указан верный @юзернейм или ID чата.",
+            parse_mode="HTML"
+        )
+
+@dp.message(Command("dellpoint"))
+async def cmd_dellpoint(message: Message):
+    if message.from_user.id != ADMIN_USER_ID:
+        await message.answer("⛔ Данная команда доступна только главному администратору.")
+        return
+
+    parts = message.text.split(maxsplit=1)
+    if len(parts) > 1 and parts[1].strip():
+        arg = parts[1].strip()
+        query_db("DELETE FROM report_points WHERE chat_id = ? OR title = ?", (arg, arg))
+        await message.answer(f"🗑 Точка отчётов <b>{html.escape(arg)}</b> отключена.", parse_mode="HTML")
+        return
+
+    if message.chat.type in ("group", "supergroup", "channel"):
+        cid = str(message.chat.id)
+        query_db("DELETE FROM report_points WHERE chat_id = ?", (cid,))
+        await message.answer("🗑 Эта группа отключена от вечерней рассылки отчётов.", parse_mode="HTML")
+        return
+
+    points = query_db("SELECT * FROM report_points")
+    if not points:
+        await message.answer("ℹ️ Активных точек отчётов не найдено.")
+        return
+
+    query_db("DELETE FROM report_points")
+    await message.answer("🗑 Все точки отчётов (вечерняя рассылка в 22:00) успешно отключены.", parse_mode="HTML")
+
+async def daily_point_scheduler():
+    """Фоновая задача: рассылка статистики блогеров каждый вечер в 22:00 по киевскому времени."""
+    logger.info("Запущен планировщик вечерних отчётов (22:00 по Киеву).")
+    while True:
+        try:
+            now = datetime.now(KYIV_TZ)
+            target = now.replace(hour=22, minute=0, second=0, microsecond=0)
+            if now >= target:
+                target += timedelta(days=1)
+
+            sleep_seconds = (target - now).total_seconds()
+            logger.info(f"Следующий вечерний отчёт запланирован на {target.strftime('%d.%m.%Y %H:%M:%S')} (через {int(sleep_seconds)} сек.)")
+            await asyncio.sleep(sleep_seconds)
+
+            points = query_db("SELECT * FROM report_points")
+            if points and bot:
+                report_text = format_blogger_stats_text("📊 <b>Ежедневный отчёт по блогерам (22:00 Киев):</b>\n")
+                for p in points:
+                    cid = p.get("chat_id")
+                    if not cid:
+                        continue
+                    try:
+                        await bot.send_message(cid, report_text, parse_mode="HTML")
+                        logger.info(f"Вечерний отчёт успешно доставлен в {cid} ({p.get('title')})")
+                    except Exception as post_err:
+                        logger.warning(f"Не удалось отправить вечерний отчёт в {cid}: {post_err}")
+
+            await asyncio.sleep(65)
+        except asyncio.CancelledError:
+            break
+        except Exception as loop_err:
+            logger.error(f"Ошибка в daily_point_scheduler: {loop_err}")
+            await asyncio.sleep(60)
 
 @dp.callback_query(F.data.startswith("blog_plan:"))
 async def cb_select_blogger_plan(callback: CallbackQuery, state: FSMContext):
@@ -1470,46 +1548,14 @@ async def cb_show_blogger_stats(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_USER_ID:
         return
 
-    bloggers = query_db("SELECT * FROM bloggers ORDER BY id DESC")
-    if not bloggers:
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="◀️ Назад к тарифам", callback_data="back_to_blog_menu")]
-        ])
-        await callback.message.edit_text(
-            "📋 <b>Список блогеров пуст.</b>\n\nВы еще не зарегистрировали ни одного блогера.",
-            parse_mode="HTML",
-            reply_markup=kb
-        )
-        return
-
-    text_lines = ["📊 <b>Анкеты блогеров и начисления (20%):</b>\n"]
-    for idx, b in enumerate(bloggers, 1):
-        plan = PLANS.get(b.get("plan_id"), {})
-        plan_title = plan.get("title", "Бонус")
-        tag = html.escape(str(b.get("tag", "Блогер")))
-        code = b.get("promo_code", "НЕТ")
-        refs = b.get("total_referrals", 0)
-        uah = b.get("earnings_uah", 0.0)
-        stars = b.get("earnings_stars", 0)
-
-        text_lines.append(
-            f"<b>{idx}. {tag}</b>\n"
-            f"• Промокод: <code>{code}</code>\n"
-            f"• Привлечено людей: <b>{refs} чел.</b>\n"
-            f"• Бонус зрителям: {plan_title}\n"
-            f"• 💰 Заработано (20%): <b>{uah:.2f} грн</b> | <b>{stars} ⭐</b>\n"
-            "───────────────"
-        )
-
-    text_lines.append("\n<i>Вы можете в любой момент перевести блогеру указанную сумму вручную.</i>")
-
+    text = format_blogger_stats_text()
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔄 Обновить список", callback_data="blog_stats")],
         [InlineKeyboardButton(text="➕ Зарегистрировать еще блогера", callback_data="back_to_blog_menu")],
         [InlineKeyboardButton(text="◀️ В главное меню", callback_data="back_to_main")]
     ])
 
-    await callback.message.edit_text("\n".join(text_lines), parse_mode="HTML", reply_markup=kb)
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
 
 @dp.callback_query(F.data == "back_to_blog_menu")
 async def cb_back_to_blog_menu(callback: CallbackQuery, state: FSMContext):
@@ -1792,6 +1838,7 @@ async def main():
 
     init_db()
     await start_background_web()
+    asyncio.create_task(daily_point_scheduler())
     logger.info("Database initialized. Starting Telegram bot polling...")
     if bot:
         await bot.delete_webhook(drop_pending_updates=True)
