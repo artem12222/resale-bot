@@ -297,6 +297,14 @@ def init_db():
         )
     """)
 
+    query_db("""
+        CREATE TABLE IF NOT EXISTS usage_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            action_date TEXT
+        )
+    """)
+
     try:
         user_cols = query_db("PRAGMA table_info(users)")
         existing_col_names = [c.get("name") for c in user_cols if isinstance(c, dict)]
@@ -372,10 +380,19 @@ def check_can_proceed(user_id: int) -> bool:
 
 def decrement_check(user_id: int):
     u = get_user_data(user_id)
-    today_str = str(date.today())
+    today_str = datetime.now(KYIV_TZ).strftime("%Y-%m-%d")
+
+    # Фиксируем обращение пользователя в журнале активности за сегодня
+    query_db(
+        "INSERT INTO usage_logs (user_id, action_date) VALUES (?, ?)",
+        (user_id, today_str)
+    )
+
     if u["is_lifetime"]:
+        query_db("UPDATE users SET last_check_date = ? WHERE user_id = ?", (today_str, user_id))
         return
     if u["premium_until"] and u["premium_until"] >= today_str:
+        query_db("UPDATE users SET last_check_date = ? WHERE user_id = ?", (today_str, user_id))
         return
 
     if u["checks_today"] < FREE_CHECKS_PER_DAY:
@@ -385,8 +402,8 @@ def decrement_check(user_id: int):
         )
     elif u["extra_checks"] > 0:
         query_db(
-            "UPDATE users SET extra_checks = extra_checks - 1 WHERE user_id = ?",
-            (user_id,)
+            "UPDATE users SET extra_checks = extra_checks - 1, last_check_date = ? WHERE user_id = ?",
+            (today_str, user_id)
         )
 
 def activate_plan(user_id: int, plan_id: str, method: str, amount: float, currency: str):
@@ -1356,6 +1373,94 @@ async def cmd_dellblog(message: Message):
         f"Проверить актуальный список: <code>/promoblog</code>",
         parse_mode="HTML"
     )
+
+def get_info_stats_text() -> str:
+    """Формирует отчет по пользователям за все время и за текущий день."""
+    today_str = datetime.now(KYIV_TZ).strftime("%Y-%m-%d")
+    today_formatted = datetime.now(KYIV_TZ).strftime("%d.%m.%Y")
+
+    # 1. Всего пользователей в базе
+    total_users_rows = query_db("SELECT COUNT(*) as cnt FROM users")
+    total_users = total_users_rows[0].get("cnt", 0) if total_users_rows else 0
+
+    # 2. Уникальные пользователи, воспользовавшиеся ботом сегодня
+    log_users_rows = query_db(
+        "SELECT COUNT(DISTINCT user_id) as cnt FROM usage_logs WHERE action_date = ?",
+        (today_str,)
+    )
+    logged_today = log_users_rows[0].get("cnt", 0) if log_users_rows else 0
+
+    user_today_rows = query_db(
+        "SELECT COUNT(DISTINCT user_id) as cnt FROM users WHERE last_check_date = ? AND checks_today > 0",
+        (today_str,)
+    )
+    users_today = user_today_rows[0].get("cnt", 0) if user_today_rows else 0
+
+    active_today = max(logged_today, users_today)
+
+    # 3. Всего проверок вещей за сегодня
+    total_checks_rows = query_db(
+        "SELECT COUNT(*) as cnt FROM usage_logs WHERE action_date = ?",
+        (today_str,)
+    )
+    checks_count_today = total_checks_rows[0].get("cnt", 0) if total_checks_rows else 0
+
+    # 4. Общая касса платежей за всё время
+    pay_rows = query_db(
+        "SELECT currency, SUM(amount) as s FROM payments WHERE status = 'success' GROUP BY currency"
+    )
+    total_uah = 0.0
+    total_stars = 0
+    for r in pay_rows:
+        curr = str(r.get("currency") or "").upper()
+        amt = float(r.get("s") or 0.0)
+        if curr == "UAH":
+            total_uah = amt
+        elif curr == "XTR":
+            total_stars = int(amt)
+
+    checks_line = f"• Проверок вещей сделано сегодня: <b>{checks_count_today} шт.</b>\n" if checks_count_today > 0 else ""
+
+    return (
+        "📊 <b>Статистика бота (/info)</b>\n\n"
+        f"📅 Дата: <b>{today_formatted}</b> (Киев)\n\n"
+        "👥 <b>Пользователи:</b>\n"
+        f"• Всего зарегистрировано: <b>{total_users} чел.</b>\n"
+        f"• Воспользовались ботом сегодня: <b>{active_today} чел.</b>\n"
+        f"{checks_line}\n"
+        "💰 <b>Касса за всё время:</b>\n"
+        f"• 💳 Монобанк: <b>{total_uah:.2f} грн</b>\n"
+        f"• ⭐ Telegram Stars: <b>{total_stars} ⭐</b>\n\n"
+        f"🕒 <i>Обновлено: {datetime.now(KYIV_TZ).strftime('%H:%M:%S')}</i>"
+    )
+
+def get_info_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="refresh_info")],
+        [InlineKeyboardButton(text="◀️ В главное меню", callback_data="back_to_main")]
+    ])
+
+@dp.message(Command("info"))
+async def cmd_info(message: Message):
+    if message.from_user.id != ADMIN_USER_ID:
+        await message.answer("⛔ Данная команда доступна только главному администратору.")
+        return
+
+    text = get_info_stats_text()
+    await message.answer(text, parse_mode="HTML", reply_markup=get_info_keyboard())
+
+@dp.callback_query(F.data == "refresh_info")
+async def cb_refresh_info(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_USER_ID:
+        await callback.answer("⛔ Доступно только администратору.", show_alert=True)
+        return
+
+    await callback.answer("Обновляю данные...")
+    text = get_info_stats_text()
+    try:
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=get_info_keyboard())
+    except Exception:
+        pass
 
 def format_blogger_stats_text(header: str = "📊 <b>Партнёрская статистика блогеров (20%):</b>\n") -> str:
     """Форматирует полную сводку блогеров и начислений для отправки в каналы или админу."""
