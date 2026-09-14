@@ -517,6 +517,8 @@ class PromoInputFSM(StatesGroup):
 class BloggerPromoFSM(StatesGroup):
     waiting_for_blogger_tag = State()
 
+USER_SALES_CARDS: dict[int, str] = {}
+
 ANALYSIS_PROMPT = """
 Ты — ведущий мировой эксперт-криминалист по легит-чеку, ресейлу и аутентификации брендовой одежды, обуви (кроссовок) и аксессуаров.
 Перед тобой 3 фотографии одной вещи:
@@ -562,6 +564,25 @@ ANALYSIS_PROMPT = """
 - Для реплики/пали: реальная стоимость продажи на барахолках символическая (200–500 грн).
 - Для оригинала: реальная вилка б/у рынка Украины (Шафа, OLX) и мирового (eBay, Grailed).
 
+ТРЕБОВАНИЯ К КАРТОЧКЕ ПРОДАЖИ (sales_post):
+Сгенерируй готовый продающий пост для публикации на OLX, Шафе или в барахолке Telegram.
+Формат:
+🔥 [Бренд] — [Точное название модели]
+• Бренд: ...
+• Состояние: Отличное (без нюансов)
+• Артикул / Style-code: ... (если считан с бирки)
+• Аутентичность: 100% Оригинал (любые проверки)
+• Цена: [укажи рекомендуемую цену в грн] (возможен торг)
+
+📐 Замеры (для одежды / стелька для обуви):
+- Плечи: __ см
+- Грудь (полуобхват): __ см
+- Длина по спине: __ см
+- Длина рукава от плеча: __ см
+
+📦 Отправка: Новая Почта / OLX Доставка / Безопасная оплата Shafa
+#бренд #resale #casual #streetwear #shafa #olx
+
 ФОРМАТ ОТВЕТА (строго JSON без markdown):
 {
   "brand": "Точное название бренда",
@@ -579,7 +600,8 @@ ANALYSIS_PROMPT = """
   "price_usd_min": 8,
   "price_usd_max": 15,
   "search_query_local": "Бренд тип вещи",
-  "search_query_global": "Brand model name"
+  "search_query_global": "Brand model name",
+  "sales_post": "Текст продающего объявления с замерами и эмодзи"
 }
 """
 
@@ -671,6 +693,16 @@ def extract_clean_json(text: str) -> dict:
         fallback_data["legit_reasons"] = ["Бирки, штрихкод и фурнитура соответствуют стандарту производителя"]
         fallback_data["search_query_local"] = f"{fallback_data['brand']} {fallback_data['item_name']}"
         fallback_data["search_query_global"] = f"{fallback_data['brand']} {fallback_data['item_name']}"
+        fallback_data["sales_post"] = (
+            f"🔥 {fallback_data['brand']} — {fallback_data['item_name']}\n\n"
+            f"• Бренд: {fallback_data['brand']}\n"
+            f"• Состояние: Отличное\n"
+            f"• 100% Оригинал\n"
+            f"• Цена: {fallback_data['price_uah_max']} грн (торг)\n\n"
+            "📐 Замеры:\n- Плечи: __ см\n- Грудь: __ см\n- Длина: __ см\n\n"
+            "📦 Отправка: Новая Почта / OLX Доставка / Shafa\n"
+            f"#{fallback_data['brand'].lower().replace(' ', '')} #resale #shafa #olx"
+        )
         return fallback_data
 
     logger.warning(f"Не удалось распарсить JSON: {cleaned[:200]}")
@@ -1776,6 +1808,26 @@ async def process_care_tag_photo(message: Message, state: FSMContext):
         price_usd_min = safe_int(data.get("price_usd_min"), 10)
         price_usd_max = safe_int(data.get("price_usd_max"), 20)
 
+        # Сохраняем готовую карточку продажи для текущего пользователя
+        raw_card = data.get("sales_post")
+        if not raw_card or not str(raw_card).strip():
+            raw_card = (
+                f"🔥 {brand} — {item_name}\n\n"
+                f"• Бренд: {brand}\n"
+                f"• Состояние: Отличное (без дефектов)\n"
+                f"• Период: {era}\n"
+                f"• Аутентичность: 100% Оригинал ({verdict})\n"
+                f"• Цена: {price_uah_max} грн (возможен быстрый торг)\n\n"
+                "📐 Замеры:\n"
+                "- Плечи: __ см\n"
+                "- Грудь (полуобхват): __ см\n"
+                "- Длина по спине: __ см\n"
+                "- Рукав: __ см\n\n"
+                "📦 Отправка: Новая Почта / OLX Доставка / Shafa\n"
+                f"#{brand.lower().replace(' ', '')} #resale #shafa #olx #casual"
+            )
+        USER_SALES_CARDS[message.from_user.id] = str(raw_card).strip()
+
         result_message = (
             f"🏷 <b>Бренд:</b> {brand}\n"
             f"👕 <b>Модель:</b> {item_name}\n"
@@ -1789,6 +1841,9 @@ async def process_care_tag_photo(message: Message, state: FSMContext):
         )
 
         keyboard_buttons = [
+            [
+                InlineKeyboardButton(text="📋 Карточка для продажи (Текст)", callback_data=f"show_card:{message.from_user.id}")
+            ],
             [
                 InlineKeyboardButton(text="🇺🇦 Шафа (Shafa.ua)", url=links["shafa_ua"]),
                 InlineKeyboardButton(text="🇺🇦 OLX Поиск", url=links["olx_ua"])
@@ -1807,33 +1862,38 @@ async def process_care_tag_photo(message: Message, state: FSMContext):
         kb = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
         await status_msg.delete()
         await message.answer(result_message, parse_mode="HTML", reply_markup=kb)
+@dp.callback_query(F.data.startswith("show_card:"))
+async def cb_show_sales_card(callback: CallbackQuery):
+    await callback.answer()
+    target_user_id = int(callback.data.split(":")[1])
+    card_text = USER_SALES_CARDS.get(target_user_id) or USER_SALES_CARDS.get(callback.from_user.id)
 
-    except (json.JSONDecodeError, ValueError) as json_err:
-        logger.warning(f"Ошибка парсинга ответа: {json_err}")
-        try:
-            await status_msg.edit_text(
-                "🔍 <b>Не удалось четко распознать бирку или текст.</b>\n\n"
-                "Сделайте фото ярлыка ближе, с хорошим освещением и в фокусе, чтобы цифры и штрихкод были разборчивы.",
-                parse_mode="HTML"
-            )
-        except Exception:
-            pass
-    except Exception as exc:
-        err_msg = str(exc)
-        logger.error(f"Ошибка при обработке запроса: {exc}", exc_info=True)
-        if "503" in err_msg or "UNAVAILABLE" in err_msg or "high demand" in err_msg:
-            err_text = "⏳ Серверы Google AI сейчас испытывают пиковую мировую нагрузку. Пожалуйста, подождите 15-20 секунд и нажмите «🔍 Проверить вещь» снова."
-        elif "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
-            err_text = "⏳ Превышен лимит запросов к AI в минуту. Пожалуйста, подождите 30 секунд и нажмите «🔍 Проверить вещь» снова."
-        elif "404" in err_msg or "NOT_FOUND" in err_msg:
-            err_text = f"⚠️ Модель AI временно недоступна для ключа: {html.escape(err_msg[:80])}."
-        else:
-            err_text = f"❌ Ошибка обработки: {html.escape(err_msg[:100])}"
+    if not card_text:
+        await callback.message.answer(
+            "⚠️ Карточка не найдена или устарела. Запустите проверку вещи заново через кнопку «🔍 Проверить вещь».",
+            parse_mode="HTML"
+        )
+        return
 
-        try:
-            await status_msg.edit_text(err_text, parse_mode="HTML")
-        except Exception:
-            pass
+    reply_text = (
+        "📋 <b>Готовая карточка для продажи</b>\n"
+        "<i>(Нажмите на текст ниже в сером поле, чтобы скопировать его в 1 клик для Shafa, OLX или Instagram):</i>\n\n"
+        f"<code>{html.escape(card_text)}</code>"
+    )
+
+    close_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Скрыть карточку", callback_data="close_sales_card")]
+    ])
+
+    await callback.message.answer(reply_text, parse_mode="HTML", reply_markup=close_kb)
+
+@dp.callback_query(F.data == "close_sales_card")
+async def cb_close_sales_card(callback: CallbackQuery):
+    await callback.answer()
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
 
 async def handle_health_check(request):
     return web.Response(text="Bot is running 24/7 with Turso Cloud DB!", status=200)
