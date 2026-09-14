@@ -535,6 +535,46 @@ class BloggerPromoFSM(StatesGroup):
     waiting_for_blogger_tag = State()
 
 USER_SALES_CARDS: dict[int, str] = {}
+USER_CHECK_DATA: dict[int, dict] = {}
+
+def build_sales_card_text(data: dict, username: Optional[str] = None) -> str:
+    """Формирует карточку продажи строго по заданному формату на украинском языке."""
+    brand = str(data.get("brand") or "Бренд").strip()
+    item_name = str(data.get("item_name") or "Річ").strip()
+    score = safe_int(data.get("authenticity_score"), 75)
+
+    raw_verdict = str(data.get("authenticity_verdict") or "").lower()
+    if "подделка" in raw_verdict or "реплика" in raw_verdict or "паль" in raw_verdict or "фейк" in raw_verdict or score < 40:
+        verdict_str = "Репліка (Фейк)"
+    elif "сомнительно" in raw_verdict or "сумнівно" in raw_verdict or score < 70:
+        verdict_str = "Сумнівно"
+    else:
+        verdict_str = "Оригінал"
+
+    condition = str(data.get("item_condition") or "Відмінний (без дефектів)").strip()
+    size = str(data.get("size") or "Уточнюйте").strip()
+    if size.lower() in ("не указан", "не указано", "не вказано", "none", "null", ""):
+        size = "Уточнюйте / на бирці"
+
+    price = safe_int(data.get("price_uah_max"), 0)
+    if price <= 0:
+        price = safe_int(data.get("price_uah_min"), 500)
+
+    lines = [
+        f"Назва: {brand} — {item_name}",
+        f"-{verdict_str}",
+        f"-Стан: {condition}",
+        f"-фірма, модель: {brand}, {item_name}",
+        f"-Розмір: {size}",
+        f"Ціна: {price} грн"
+    ]
+
+    # Юзернейм берется у человека, который запросил карточку. Если нет — строки нет вообще
+    if username and username.strip():
+        clean_user = username.strip().lstrip("@")
+        lines.append(f"Замовити: @{clean_user}")
+
+    return "\n".join(lines)
 
 ANALYSIS_PROMPT = """
 Ты — ведущий мировой эксперт-криминалист по легит-чеку, ресейлу и аутентификации брендовой одежды, обуви (кроссовок) и аксессуаров.
@@ -581,30 +621,11 @@ ANALYSIS_PROMPT = """
 - Для реплики/пали: реальная стоимость продажи на барахолках символическая (200–500 грн).
 - Для оригинала: реальная вилка б/у рынка Украины (Шафа, OLX) и мирового (eBay, Grailed).
 
-ТРЕБОВАНИЯ К КАРТОЧКЕ ПРОДАЖИ (sales_post):
-Сгенерируй готовый продающий пост для публикации на OLX, Шафе или в барахолке Telegram.
-Формат:
-🔥 [Бренд] — [Точное название модели]
-• Бренд: ...
-• Состояние: Отличное (без нюансов)
-• Артикул / Style-code: ... (если считан с бирки)
-• Аутентичность: 100% Оригинал (любые проверки)
-• Цена: [укажи рекомендуемую цену в грн] (возможен торг)
-
-📐 Замеры (для одежды / стелька для обуви):
-- Плечи: __ см
-- Грудь (полуобхват): __ см
-- Длина по спине: __ см
-- Длина рукава от плеча: __ см
-
-📦 Отправка: Новая Почта / OLX Доставка / Безопасная оплата Shafa
-#бренд #resale #casual #streetwear #shafa #olx
-
 ФОРМАТ ОТВЕТА (строго JSON без markdown):
 {
   "brand": "Точное название бренда",
   "category_tier": "Категория вещи",
-  "item_name": "Название модели или тип вещи",
+  "item_name": "Название модели или тип вещи (например: Худи с патчем / Кроссовки Dunk Low)",
   "era_or_year": "Примерные годы выпуска",
   "authenticity_verdict": "100% Оригинал / Оригинал / Сомнительно / Подделка (Реплика)",
   "authenticity_score": 95,
@@ -612,13 +633,14 @@ ANALYSIS_PROMPT = """
     "Конкретная техническая причина по бирке/арт-коду",
     "Причина по вышивке/швам/фурнитуре"
   ],
+  "size": "Размер с бирки (например: L, M, XL, 43 EU, US 10 или 'Не указан')",
+  "item_condition": "Отличное (без дефектов)",
   "price_uah_min": 300,
   "price_uah_max": 600,
   "price_usd_min": 8,
   "price_usd_max": 15,
   "search_query_local": "Бренд тип вещи",
-  "search_query_global": "Brand model name",
-  "sales_post": "Текст продающего объявления с замерами и эмодзи"
+  "search_query_global": "Brand model name"
 }
 """
 
@@ -703,6 +725,8 @@ def extract_clean_json(text: str) -> dict:
         fallback_data["era_or_year"] = "Актуальная коллекция"
         fallback_data["authenticity_verdict"] = verdict_match.group(1) if verdict_match else "Оригинал"
         fallback_data["authenticity_score"] = int(score_match.group(1)) if score_match else 85
+        fallback_data["size"] = "Не вказано"
+        fallback_data["item_condition"] = "Відмінний (без дефектів)"
         fallback_data["price_uah_min"] = int(price_uah_min.group(1)) if price_uah_min else 300
         fallback_data["price_uah_max"] = int(price_uah_max.group(1)) if price_uah_max else 700
         fallback_data["price_usd_min"] = max(10, fallback_data["price_uah_min"] // 40)
@@ -710,16 +734,6 @@ def extract_clean_json(text: str) -> dict:
         fallback_data["legit_reasons"] = ["Бирки, штрихкод и фурнитура соответствуют стандарту производителя"]
         fallback_data["search_query_local"] = f"{fallback_data['brand']} {fallback_data['item_name']}"
         fallback_data["search_query_global"] = f"{fallback_data['brand']} {fallback_data['item_name']}"
-        fallback_data["sales_post"] = (
-            f"🔥 {fallback_data['brand']} — {fallback_data['item_name']}\n\n"
-            f"• Бренд: {fallback_data['brand']}\n"
-            f"• Состояние: Отличное\n"
-            f"• 100% Оригинал\n"
-            f"• Цена: {fallback_data['price_uah_max']} грн (торг)\n\n"
-            "📐 Замеры:\n- Плечи: __ см\n- Грудь: __ см\n- Длина: __ см\n\n"
-            "📦 Отправка: Новая Почта / OLX Доставка / Shafa\n"
-            f"#{fallback_data['brand'].lower().replace(' ', '')} #resale #shafa #olx"
-        )
         return fallback_data
 
     logger.warning(f"Не удалось распарсить JSON: {cleaned[:200]}")
@@ -1913,25 +1927,9 @@ async def process_care_tag_photo(message: Message, state: FSMContext):
         price_usd_min = safe_int(data.get("price_usd_min"), 10)
         price_usd_max = safe_int(data.get("price_usd_max"), 20)
 
-        # Сохраняем готовую карточку продажи для текущего пользователя
-        raw_card = data.get("sales_post")
-        if not raw_card or not str(raw_card).strip():
-            raw_card = (
-                f"🔥 {brand} — {item_name}\n\n"
-                f"• Бренд: {brand}\n"
-                f"• Состояние: Отличное (без дефектов)\n"
-                f"• Период: {era}\n"
-                f"• Аутентичность: 100% Оригинал ({verdict})\n"
-                f"• Цена: {price_uah_max} грн (возможен быстрый торг)\n\n"
-                "📐 Замеры:\n"
-                "- Плечи: __ см\n"
-                "- Грудь (полуобхват): __ см\n"
-                "- Длина по спине: __ см\n"
-                "- Рукав: __ см\n\n"
-                "📦 Отправка: Новая Почта / OLX Доставка / Shafa\n"
-                f"#{brand.lower().replace(' ', '')} #resale #shafa #olx #casual"
-            )
-        USER_SALES_CARDS[message.from_user.id] = str(raw_card).strip()
+        # Сохраняем сырые данные и сформированную карточку с юзернеймом автора
+        USER_CHECK_DATA[message.from_user.id] = data
+        USER_SALES_CARDS[message.from_user.id] = build_sales_card_text(data, message.from_user.username)
 
         result_message = (
             f"🏷 <b>Бренд:</b> {brand}\n"
@@ -1999,7 +1997,17 @@ async def process_care_tag_photo(message: Message, state: FSMContext):
 async def cb_show_sales_card(callback: CallbackQuery):
     await callback.answer()
     target_user_id = int(callback.data.split(":")[1])
-    card_text = USER_SALES_CARDS.get(target_user_id) or USER_SALES_CARDS.get(callback.from_user.id)
+    
+    # Берем данные проверки
+    check_data = USER_CHECK_DATA.get(target_user_id) or USER_CHECK_DATA.get(callback.from_user.id)
+    
+    # Юзернейм берем у того, кто запросил карточку прямо сейчас (или из профиля)
+    req_username = callback.from_user.username
+    
+    if check_data:
+        card_text = build_sales_card_text(check_data, req_username)
+    else:
+        card_text = USER_SALES_CARDS.get(target_user_id) or USER_SALES_CARDS.get(callback.from_user.id)
 
     if not card_text:
         await callback.message.answer(
@@ -2009,13 +2017,13 @@ async def cb_show_sales_card(callback: CallbackQuery):
         return
 
     reply_text = (
-        "📋 <b>Готовая карточка для продажи</b>\n"
-        "<i>(Нажмите на текст ниже в сером поле, чтобы скопировать его в 1 клик для Shafa, OLX или Instagram):</i>\n\n"
+        "📋 <b>Готова картка для продажу</b>\n"
+        "<i>(Натисніть на текст нижче в сірому полі, щоб скопіювати його в 1 клік):</i>\n\n"
         f"<code>{html.escape(card_text)}</code>"
     )
 
     close_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="❌ Скрыть карточку", callback_data="close_sales_card")]
+        [InlineKeyboardButton(text="❌ Сховати картку", callback_data="close_sales_card")]
     ])
 
     await callback.message.answer(reply_text, parse_mode="HTML", reply_markup=close_kb)
