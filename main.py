@@ -1862,6 +1862,34 @@ async def process_care_tag_photo(message: Message, state: FSMContext):
         kb = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
         await status_msg.delete()
         await message.answer(result_message, parse_mode="HTML", reply_markup=kb)
+
+    except (json.JSONDecodeError, ValueError) as json_err:
+        logger.warning(f"Ошибка парсинга ответа: {json_err}")
+        try:
+            await status_msg.edit_text(
+                "🔍 <b>Не удалось четко распознать бирку или текст.</b>\n\n"
+                "Сделайте фото ярлыка ближе, с хорошим освещением и в фокусе, чтобы цифры и штрихкод были разборчивы.",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+    except Exception as exc:
+        err_msg = str(exc)
+        logger.error(f"Ошибка при обработке запроса: {exc}", exc_info=True)
+        if "503" in err_msg or "UNAVAILABLE" in err_msg or "high demand" in err_msg:
+            err_text = "⏳ Серверы Google AI сейчас испытывают пиковую мировую нагрузку. Пожалуйста, подождите 15-20 секунд и нажмите «🔍 Проверить вещь» снова."
+        elif "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
+            err_text = "⏳ Превышен лимит запросов к AI в минуту. Пожалуйста, подождите 30 секунд и нажмите «🔍 Проверить вещь» снова."
+        elif "404" in err_msg or "NOT_FOUND" in err_msg:
+            err_text = f"⚠️ Модель AI временно недоступна для ключа: {html.escape(err_msg[:80])}."
+        else:
+            err_text = f"❌ Ошибка обработки: {html.escape(err_msg[:100])}"
+
+        try:
+            await status_msg.edit_text(err_text, parse_mode="HTML")
+        except Exception:
+            pass
+
 @dp.callback_query(F.data.startswith("show_card:"))
 async def cb_show_sales_card(callback: CallbackQuery):
     await callback.answer()
