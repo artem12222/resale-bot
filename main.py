@@ -56,6 +56,9 @@ MONOBANK_TOKEN = os.getenv("MONOBANK_TOKEN", "").strip()
 FREE_CHECKS_PER_DAY = 3
 DB_NAME = "resale_bot.db"
 
+CHANNEL_USERNAME = "@crimeprok"
+CHANNEL_URL = "https://t.me/crimeprok"
+
 DEFAULT_TURSO_URL = "libsql://resale-db-artem12222.aws-ap-south-1.turso.io"
 DEFAULT_TURSO_TOKEN = (
     "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJleHAiOjc5NzQzNzI1NDUsImlhdCI6MTc4ODczNzM0NSwiaWQiOiIw"
@@ -232,6 +235,18 @@ def init_db():
         )
     """)
 
+    try:
+        user_cols = query_db("PRAGMA table_info(users)")
+        existing_col_names = [c.get("name") for c in user_cols if isinstance(c, dict)]
+        if "referred_by_blogger" not in existing_col_names:
+            query_db("ALTER TABLE users ADD COLUMN referred_by_blogger TEXT DEFAULT NULL")
+        if "initial_checks_used" not in existing_col_names:
+            query_db("ALTER TABLE users ADD COLUMN initial_checks_used INTEGER DEFAULT 0")
+        if "sub_prompt_shown" not in existing_col_names:
+            query_db("ALTER TABLE users ADD COLUMN sub_prompt_shown INTEGER DEFAULT 0")
+    except Exception as e:
+        logger.debug(f"Проверка колонок users: {e}")
+
     query_db("""
         CREATE TABLE IF NOT EXISTS payments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -315,14 +330,25 @@ def init_db():
 
     logger.info("База данных инициализирована (Turso Cloud / SQLite)")
 
-def get_user_data(user_id: int, username: Optional[str] = None) -> dict:
+async def check_channel_subscription(user_id: int) -> bool:
+    """Проверяет через Telegram API, подписан ли пользователь на канал."""
+    if not bot or user_id == ADMIN_USER_ID:
+        return True
+    try:
+        chat_member = await bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=user_id)
+        return chat_member.status in ("member", "administrator", "creator", "restricted")
+    except Exception as e:
+        logger.debug(f"Ошибка проверки подписки {user_id} на {CHANNEL_USERNAME}: {e}")
+        return False
+
+def get_user_data(user_id: int, username: Optional[str] = None, is_subscribed: bool = True) -> dict:
     today_str = str(date.today())
     rows = query_db("SELECT * FROM users WHERE user_id = ?", (user_id,))
 
     if not rows:
         query_db(
-            """INSERT INTO users (user_id, username, checks_today, last_check_date, is_premium, extra_checks, premium_until, is_lifetime) 
-               VALUES (?, ?, 0, ?, 0, 0, NULL, 0)""",
+            """INSERT INTO users (user_id, username, checks_today, last_check_date, is_premium, extra_checks, premium_until, is_lifetime, initial_checks_used) 
+               VALUES (?, ?, 0, ?, 0, 0, NULL, 0, 0)""",
             (user_id, username, today_str)
         )
         return {
@@ -331,7 +357,9 @@ def get_user_data(user_id: int, username: Optional[str] = None) -> dict:
             "extra_checks": 0,
             "premium_until": None,
             "is_lifetime": 0,
-            "status_text": f"{FREE_CHECKS_PER_DAY} бесплатных на сегодня"
+            "initial_checks_used": 0,
+            "is_subscribed": is_subscribed,
+            "status_text": f"{FREE_CHECKS_PER_DAY} бесплатных на сегодня" if is_subscribed else f"{FREE_CHECKS_PER_DAY} стартовых проверок"
         }
 
     row = rows[0]
@@ -340,7 +368,9 @@ def get_user_data(user_id: int, username: Optional[str] = None) -> dict:
     extra_checks = int(row.get("extra_checks") or 0)
     premium_until = row.get("premium_until")
     is_lifetime = int(row.get("is_lifetime") or 0)
+    initial_checks_used = int(row.get("initial_checks_used") or 0)
 
+    # Ежедневный сброс счетчика
     if last_date != today_str:
         checks_today = 0
         query_db("UPDATE users SET checks_today = 0, last_check_date = ? WHERE user_id = ?", (today_str, user_id))
@@ -350,11 +380,16 @@ def get_user_data(user_id: int, username: Optional[str] = None) -> dict:
     elif premium_until and premium_until >= today_str:
         status_text = f"👑 Безлимит активен до {premium_until}"
     elif extra_checks > 0:
-        free_rem = max(0, FREE_CHECKS_PER_DAY - checks_today)
+        free_rem = max(0, FREE_CHECKS_PER_DAY - checks_today) if is_subscribed else 0
         status_text = f"{free_rem} беспл. + {extra_checks} из пакета"
-    else:
+    elif is_subscribed:
         free_rem = max(0, FREE_CHECKS_PER_DAY - checks_today)
-        status_text = f"{free_rem} из {FREE_CHECKS_PER_DAY} бесплатных"
+        status_text = f"{free_rem} из {FREE_CHECKS_PER_DAY} бесплатных (Канал ✅)"
+    elif initial_checks_used < FREE_CHECKS_PER_DAY:
+        start_rem = max(0, FREE_CHECKS_PER_DAY - initial_checks_used)
+        status_text = f"{start_rem} стартовых (Подпишитесь на канал для 3/день)"
+    else:
+        status_text = "0 проверок (Подпишитесь на @crimeprok для 3/день)"
 
     return {
         "user_id": user_id,
@@ -362,24 +397,39 @@ def get_user_data(user_id: int, username: Optional[str] = None) -> dict:
         "extra_checks": extra_checks,
         "premium_until": premium_until,
         "is_lifetime": is_lifetime,
+        "initial_checks_used": initial_checks_used,
+        "is_subscribed": is_subscribed,
         "status_text": status_text
     }
 
-def check_can_proceed(user_id: int) -> bool:
-    u = get_user_data(user_id)
+async def check_can_proceed(user_id: int) -> tuple[bool, str]:
+    """Проверяет доступ пользователя к проверке с учетом подписки на канал."""
+    is_sub = await check_channel_subscription(user_id)
+    u = get_user_data(user_id, is_subscribed=is_sub)
     today_str = str(date.today())
-    if u["is_lifetime"]:
-        return True
-    if u["premium_until"] and u["premium_until"] >= today_str:
-        return True
-    if u["checks_today"] < FREE_CHECKS_PER_DAY:
-        return True
-    if u["extra_checks"] > 0:
-        return True
-    return False
 
-def decrement_check(user_id: int):
-    u = get_user_data(user_id)
+    if u["is_lifetime"]:
+        return True, "ok"
+    if u["premium_until"] and u["premium_until"] >= today_str:
+        return True, "ok"
+    if u["extra_checks"] > 0:
+        return True, "ok"
+
+    # Если подписан на канал — получает 3 проверки каждый день (не суммируются)
+    if is_sub:
+        if u["checks_today"] < FREE_CHECKS_PER_DAY:
+            return True, "ok"
+        return False, "daily_limit"
+
+    # Если НЕ подписан — даем использовать только 3 стартовые проверки
+    if u["initial_checks_used"] < FREE_CHECKS_PER_DAY:
+        return True, "ok"
+
+    return False, "need_sub"
+
+async def decrement_check(user_id: int):
+    is_sub = await check_channel_subscription(user_id)
+    u = get_user_data(user_id, is_subscribed=is_sub)
     today_str = datetime.now(KYIV_TZ).strftime("%Y-%m-%d")
 
     # Фиксируем обращение пользователя в журнале активности за сегодня
@@ -388,21 +438,23 @@ def decrement_check(user_id: int):
         (user_id, today_str)
     )
 
-    if u["is_lifetime"]:
-        query_db("UPDATE users SET last_check_date = ? WHERE user_id = ?", (today_str, user_id))
-        return
-    if u["premium_until"] and u["premium_until"] >= today_str:
+    if u["is_lifetime"] or (u["premium_until"] and u["premium_until"] >= today_str):
         query_db("UPDATE users SET last_check_date = ? WHERE user_id = ?", (today_str, user_id))
         return
 
-    if u["checks_today"] < FREE_CHECKS_PER_DAY:
+    if u["extra_checks"] > 0:
+        query_db(
+            "UPDATE users SET extra_checks = extra_checks - 1, last_check_date = ? WHERE user_id = ?",
+            (today_str, user_id)
+        )
+    elif is_sub:
         query_db(
             "UPDATE users SET checks_today = checks_today + 1, last_check_date = ? WHERE user_id = ?",
             (today_str, user_id)
         )
-    elif u["extra_checks"] > 0:
+    else:
         query_db(
-            "UPDATE users SET extra_checks = extra_checks - 1, last_check_date = ? WHERE user_id = ?",
+            "UPDATE users SET initial_checks_used = initial_checks_used + 1, last_check_date = ? WHERE user_id = ?",
             (today_str, user_id)
         )
 
@@ -852,6 +904,15 @@ def get_main_menu_keyboard():
         [InlineKeyboardButton(text="🎟 Ввести промокод", callback_data="enter_promo")]
     ])
 
+def get_subscription_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📢 Подписаться на канал", url=CHANNEL_URL)],
+        [
+            InlineKeyboardButton(text="✅ Я подписался", callback_data="check_channel_sub"),
+            InlineKeyboardButton(text="❌ Отказаться", callback_data="decline_channel_sub")
+        ]
+    ])
+
 def get_plans_keyboard():
     buttons = []
     for plan_key, plan in PLANS.items():
@@ -863,8 +924,26 @@ def get_plans_keyboard():
 @dp.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
-    u = get_user_data(message.from_user.id, message.from_user.username)
+    user_id = message.from_user.id
+    username = message.from_user.username
     name = html.escape(message.from_user.first_name or "Пользователь")
+
+    is_sub = await check_channel_subscription(user_id)
+    u = get_user_data(user_id, username, is_subscribed=is_sub)
+
+    # Если пользователь не подписан и не имеет платного безлимита — предлагаем подписку
+    if not is_sub and not u["is_lifetime"] and not (u["premium_until"] and u["premium_until"] >= str(date.today())):
+        sub_text = (
+            f"👋 Привет, <b>{name}</b>!\n\n"
+            "🎁 <b>Хочешь получать каждый день по 3 бесплатных проверки?</b>\n\n"
+            "Подпишись на наш официальный Telegram-канал:\n"
+            f"👉 <a href=\"{CHANNEL_URL}\"><b>{CHANNEL_USERNAME}</b></a>\n\n"
+            "Там публикуются находки с секондов, дропы, примеры пали и секреты ресейла одежды и кроссовок!\n\n"
+            "После подписки нажми кнопку <b>«✅ Я подписался»</b> ниже 👇"
+        )
+        await message.answer(sub_text, parse_mode="HTML", reply_markup=get_subscription_keyboard(), disable_web_page_preview=True)
+        return
+
     welcome_text = (
         f"👋 Привет, <b>{name}</b>!\n\n"
         "Я — <b>Resale & Legit Checker Bot</b>.\n"
@@ -872,16 +951,56 @@ async def cmd_start(message: Message, state: FSMContext):
         "• Распознаю любой бренд, точную модель и артикул\n"
         "• Проведу экспертный легит-чек по биркам, штрихкодам и фурнитуре\n"
         "• Покажу реальную стоимость на вторичке (Шафа, OLX) и проданные пары на eBay\n"
-        "• Сгенерирую готовые поисковые ссылки на маркетплейсы\n\n"
+        "• Сгенерирую готовую карточку для быстрой продажи в 1 клик\n\n"
         f"📊 Твой статус: <b>{html.escape(u['status_text'])}</b>."
     )
     await message.answer(welcome_text, parse_mode="HTML", reply_markup=get_main_menu_keyboard())
+
+@dp.callback_query(F.data == "check_channel_sub")
+async def cb_check_channel_sub(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    is_sub = await check_channel_subscription(user_id)
+
+    if is_sub:
+        await callback.answer("✅ Подписка подтверждена!", show_alert=False)
+        u = get_user_data(user_id, callback.from_user.username, is_subscribed=True)
+        congrats_text = (
+            "✅ <b>Подписка успешно подтверждена!</b>\n\n"
+            "Вам активированы <b>3 бесплатные проверки</b> на сегодня (обновляются каждые сутки при активной подписке).\n\n"
+            f"📊 Твой статус: <b>{html.escape(u['status_text'])}</b>.\n\n"
+            "Выберите действие в меню ниже 👇"
+        )
+        await callback.message.edit_text(congrats_text, parse_mode="HTML", reply_markup=get_main_menu_keyboard())
+    else:
+        await callback.answer(f"❌ Вы еще не подписались на {CHANNEL_USERNAME}!", show_alert=True)
+        remind_text = (
+            "⚠️ <b>Подписка не обнаружена!</b>\n\n"
+            f"Пожалуйста, перейдите в канал <a href=\"{CHANNEL_URL}\"><b>{CHANNEL_USERNAME}</b></a>, нажмите кнопку «Подписаться» и после этого нажмите кнопку <b>«✅ Я подписался»</b>."
+        )
+        try:
+            await callback.message.edit_text(remind_text, parse_mode="HTML", reply_markup=get_subscription_keyboard(), disable_web_page_preview=True)
+        except Exception:
+            pass
+
+@dp.callback_query(F.data == "decline_channel_sub")
+async def cb_decline_channel_sub(callback: CallbackQuery):
+    await callback.answer()
+    user_id = callback.from_user.id
+    u = get_user_data(user_id, callback.from_user.username, is_subscribed=False)
+    decline_text = (
+        "👌 <b>Вы отказались от подписки на канал.</b>\n\n"
+        "Вам доступны только разовые стартовые проверки. Без подписки на канал ежедневные 3 проверки начисляться не будут.\n\n"
+        f"📊 Твой статус: <b>{html.escape(u['status_text'])}</b>.\n\n"
+        f"Вы можете подписаться на <a href=\"{CHANNEL_URL}\">{CHANNEL_USERNAME}</a> в любой момент, чтобы вернуть ежедневные бесплатные проверки!"
+    )
+    await callback.message.edit_text(decline_text, parse_mode="HTML", reply_markup=get_main_menu_keyboard(), disable_web_page_preview=True)
 
 @dp.callback_query(F.data == "back_to_main")
 async def cb_back_to_main(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     await state.clear()
-    u = get_user_data(callback.from_user.id, callback.from_user.username)
+    is_sub = await check_channel_subscription(callback.from_user.id)
+    u = get_user_data(callback.from_user.id, callback.from_user.username, is_subscribed=is_sub)
     welcome_text = (
         "👋 <b>Главное меню</b>\n\n"
         f"📊 Твой статус: <b>{html.escape(u['status_text'])}</b>.\n\n"
@@ -892,11 +1011,15 @@ async def cb_back_to_main(callback: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "show_profile")
 async def cb_show_profile(callback: CallbackQuery):
     await callback.answer()
-    u = get_user_data(callback.from_user.id, callback.from_user.username)
+    is_sub = await check_channel_subscription(callback.from_user.id)
+    u = get_user_data(callback.from_user.id, callback.from_user.username, is_subscribed=is_sub)
+    
+    sub_channel_status = "✅ Подписан (3 проверки/день)" if is_sub else f"❌ Не подписан (<a href=\"{CHANNEL_URL}\">Подписаться</a>)"
     text = (
         "👤 <b>Ваш профиль:</b>\n\n"
         f"🆔 Telegram ID: <code>{callback.from_user.id}</code>\n"
-        f"⚡ Статус аккаунта: <b>{html.escape(u['status_text'])}</b>\n\n"
+        f"⚡ Статус аккаунта: <b>{html.escape(u['status_text'])}</b>\n"
+        f"📢 Канал {CHANNEL_USERNAME}: {sub_channel_status}\n\n"
         f"• Использовано бесплатных сегодня: {u['checks_today']} из {FREE_CHECKS_PER_DAY}\n"
         f"• Дополнительных проверок: {u['extra_checks']}\n"
         f"• Подписка активна до: {u['premium_until'] or 'Нет активной'}\n\n"
@@ -906,7 +1029,7 @@ async def cb_show_profile(callback: CallbackQuery):
         [InlineKeyboardButton(text="💎 Выбрать тариф", callback_data="show_plans")],
         [InlineKeyboardButton(text="◀️ В меню", callback_data="back_to_main")]
     ])
-    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
 
 @dp.callback_query(F.data == "show_plans")
 async def cb_show_plans(callback: CallbackQuery):
@@ -1818,11 +1941,29 @@ async def process_promo_input(message: Message, state: FSMContext):
 async def cb_start_check(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     user_id = callback.from_user.id
-    if not check_can_proceed(user_id):
+
+    can_proceed, reason = await check_can_proceed(user_id)
+    if not can_proceed:
+        if reason == "need_sub":
+            text = (
+                "📢 <b>Подпишитесь на канал для бесплатных проверок!</b>\n\n"
+                "Вы исчерпали стартовые проверки. Чтобы получать <b>3 бесплатные проверки каждый день</b>, подпишитесь на наш канал:\n"
+                f"👉 <a href=\"{CHANNEL_URL}\"><b>{CHANNEL_USERNAME}</b></a>\n\n"
+                "После подписки нажмите <b>«✅ Я подписался»</b> 👇"
+            )
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📢 Подписаться на канал", url=CHANNEL_URL)],
+                [InlineKeyboardButton(text="✅ Я подписался", callback_data="check_channel_sub")],
+                [InlineKeyboardButton(text="💎 Снять лимит (Тарифы)", callback_data="show_plans")],
+                [InlineKeyboardButton(text="◀️ В меню", callback_data="back_to_main")]
+            ])
+            await callback.message.answer(text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
+            return
+
         text = (
             "⚠️ <b>Лимит проверок исчерпан!</b>\n\n"
             f"Вы использовали все {FREE_CHECKS_PER_DAY} бесплатные проверки на сегодня.\n"
-            "Чтобы проверить вещь прямо сейчас, выберите пакет проверок или оформите безлимит 👇"
+            "Они автоматически обновятся завтра, либо вы можете снять лимит прямо сейчас 👇"
         )
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="💎 Снять лимит (Тарифы)", callback_data="show_plans")],
@@ -1895,8 +2036,9 @@ async def process_care_tag_photo(message: Message, state: FSMContext):
         ]
 
         data = await analyze_with_gemini_fallback(image_parts)
-        decrement_check(message.from_user.id)
-        u = get_user_data(message.from_user.id)
+        await decrement_check(message.from_user.id)
+        is_sub = await check_channel_subscription(message.from_user.id)
+        u = get_user_data(message.from_user.id, is_subscribed=is_sub)
 
         brand = html.escape(str(data.get("brand") or "Не определен"))
         item_name = html.escape(str(data.get("item_name") or "Вещь / Обувь"))
