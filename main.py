@@ -294,6 +294,22 @@ def init_db():
         )
     """)
 
+    try:
+        blogger_cols = query_db("PRAGMA table_info(bloggers)")
+        existing_b_names = [c.get("name") for c in blogger_cols if isinstance(c, dict)]
+        if "commission_rate" not in existing_b_names:
+            query_db("ALTER TABLE bloggers ADD COLUMN commission_rate REAL DEFAULT 20.0")
+        if "fine_percent" not in existing_b_names:
+            query_db("ALTER TABLE bloggers ADD COLUMN fine_percent REAL DEFAULT 0.0")
+        if "fine_until" not in existing_b_names:
+            query_db("ALTER TABLE bloggers ADD COLUMN fine_until TEXT DEFAULT NULL")
+        if "total_paid_uah" not in existing_b_names:
+            query_db("ALTER TABLE bloggers ADD COLUMN total_paid_uah REAL DEFAULT 0.0")
+        if "total_paid_stars" not in existing_b_names:
+            query_db("ALTER TABLE bloggers ADD COLUMN total_paid_stars INTEGER DEFAULT 0")
+    except Exception as e:
+        logger.debug(f"Проверка колонок bloggers: {e}")
+
     query_db("""
         CREATE TABLE IF NOT EXISTS blogger_promo_uses (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -499,18 +515,33 @@ def activate_plan(user_id: int, plan_id: str, method: str, amount: float, curren
             blogger_data = query_db("SELECT * FROM bloggers WHERE tag = ?", (blogger_tag,))
             if blogger_data:
                 b = blogger_data[0]
+                today_str = datetime.now(KYIV_TZ).strftime("%Y-%m-%d")
+                base_rate = float(b.get("commission_rate") or 20.0)
+                fine_pct = float(b.get("fine_percent") or 0.0)
+                fine_until = b.get("fine_until")
+
+                # Применяем штраф, если срок его действия (1 месяц) ещё не истёк
+                if fine_until and fine_until >= today_str:
+                    effective_rate = max(0.0, base_rate - fine_pct)
+                    rate_desc = f"{effective_rate:.1f}% (штраф -{fine_pct:.0f}% до {fine_until})"
+                else:
+                    effective_rate = base_rate
+                    rate_desc = f"{effective_rate:.1f}%"
+
+                fraction = effective_rate / 100.0
+
                 if currency == "UAH":
-                    commission = round(amount * 0.20, 2)
+                    commission = round(amount * fraction, 2)
                     new_earnings = round((b.get("earnings_uah") or 0.0) + commission, 2)
                     query_db("UPDATE bloggers SET earnings_uah = ? WHERE id = ?", (new_earnings, b["id"]))
-                    comm_text = f"<b>+{commission} грн</b> (20% от {amount} грн)"
+                    comm_text = f"<b>+{commission} грн</b> ({rate_desc} от {amount} грн)"
                 elif currency == "XTR":
-                    commission_stars = int(amount * 0.20)
+                    commission_stars = int(amount * fraction)
                     new_stars = int((b.get("earnings_stars") or 0) + commission_stars)
                     query_db("UPDATE bloggers SET earnings_stars = ? WHERE id = ?", (new_stars, b["id"]))
-                    comm_text = f"<b>+{commission_stars} ⭐</b> (20% от {amount} ⭐)"
+                    comm_text = f"<b>+{commission_stars} ⭐</b> ({rate_desc} от {amount} ⭐)"
                 else:
-                    comm_text = f"<b>20%</b> от {amount} {currency}"
+                    comm_text = f"<b>{effective_rate:.1f}%</b> от {amount} {currency}"
 
                 if bot:
                     asyncio.create_task(
@@ -585,6 +616,10 @@ class PromoInputFSM(StatesGroup):
 
 class BloggerPromoFSM(StatesGroup):
     waiting_for_blogger_tag = State()
+
+class BloggerFineFSM(StatesGroup):
+    waiting_for_blogger_ident = State()
+    waiting_for_fine_value = State()
 
 USER_SALES_CARDS: dict[int, str] = {}
 USER_CHECK_DATA: dict[int, dict] = {}
@@ -1609,6 +1644,7 @@ def format_blogger_stats_text(header: str = "📊 <b>Партнёрская ст
     total_refs = 0
     total_uah = 0.0
     total_stars = 0
+    today_str = datetime.now(KYIV_TZ).strftime("%Y-%m-%d")
 
     for idx, b in enumerate(bloggers, 1):
         plan = PLANS.get(b.get("plan_id"), {})
@@ -1618,6 +1654,24 @@ def format_blogger_stats_text(header: str = "📊 <b>Партнёрская ст
         refs = int(b.get("total_referrals") or 0)
         uah = float(b.get("earnings_uah") or 0.0)
         stars = int(b.get("earnings_stars") or 0)
+        paid_uah = float(b.get("total_paid_uah") or 0.0)
+        paid_stars = int(b.get("total_paid_stars") or 0)
+
+        base_rate = float(b.get("commission_rate") or 20.0)
+        fine_pct = float(b.get("fine_percent") or 0.0)
+        fine_until = b.get("fine_until")
+
+        if fine_until and fine_until >= today_str and fine_pct > 0:
+            effective_rate = max(0.0, base_rate - fine_pct)
+            fine_info = f"\n• ⚠️ <b>Штраф: -{fine_pct:.0f}%</b> на 1 мес. (до {fine_until}, ставка: <b>{effective_rate:.0f}%</b>)"
+        elif base_rate != 20.0:
+            fine_info = f"\n• ⚙️ <b>Ставка: {base_rate:.0f}%</b>"
+        else:
+            fine_info = "\n• 💎 Ставка: <b>20%</b>"
+
+        payout_info = ""
+        if paid_uah > 0 or paid_stars > 0:
+            payout_info = f"\n• ✅ Всего выплачено ранее: {paid_uah:.2f} грн | {paid_stars} ⭐"
 
         total_refs += refs
         total_uah += uah
@@ -1627,211 +1681,268 @@ def format_blogger_stats_text(header: str = "📊 <b>Партнёрская ст
             f"<b>{idx}. {tag}</b>\n"
             f"• Промокод: <code>{code}</code>\n"
             f"• Привлечено: <b>{refs} чел.</b>\n"
-            f"• Бонус зрителям: {plan_title}\n"
-            f"• 💰 Заработано (20%): <b>{uah:.2f} грн</b> | <b>{stars} ⭐</b>\n"
+            f"• Бонус зрителям: {plan_title}"
+            f"{fine_info}\n"
+            f"• 💰 <b>К выплате (накоплено): {uah:.2f} грн</b> | <b>{stars} ⭐</b>"
+            f"{payout_info}\n"
             "───────────────"
         )
 
     text_lines.append(
         f"\n📈 <b>Итого по всем блогерам:</b>\n"
         f"• Всего рефералов: <b>{total_refs} чел.</b>\n"
-        f"• К выплате суммарно: <b>{total_uah:.2f} грн</b> | <b>{total_stars} ⭐</b>\n\n"
+        f"• Суммарно к выплате: <b>{total_uah:.2f} грн</b> | <b>{total_stars} ⭐</b>\n\n"
         f"🕒 <i>Сформировано: {datetime.now(KYIV_TZ).strftime('%d.%m.%Y %H:%M')} (Киев)</i>"
     )
     return "\n".join(text_lines)
 
-@dp.message(Command("point"))
-async def cmd_point(message: Message):
+def get_admin_blogger_plans_keyboard():
+    buttons = []
+    for plan_key, plan in PLANS.items():
+        buttons.append([InlineKeyboardButton(text=f"🎁 {plan['title']}", callback_data=f"blog_plan:{plan_key}")])
+    buttons.append([InlineKeyboardButton(text="📊 Список блогеров и статистика", callback_data="blog_stats")])
+    buttons.append([
+        InlineKeyboardButton(text="⚖️ Назначить штраф (%)", callback_data="blog_fine_start"),
+        InlineKeyboardButton(text="💸 Выплата (Обнуление)", callback_data="blog_payout_start")
+    ])
+    buttons.append([InlineKeyboardButton(text="◀️ В меню", callback_data="back_to_main")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+@dp.message(Command("promoblog"))
+async def cmd_promoblog(message: Message, state: FSMContext):
     if message.from_user.id != ADMIN_USER_ID:
         await message.answer("⛔ Данная команда доступна только главному администратору.")
         return
 
-    parts = message.text.split(maxsplit=1)
-    target_chat = None
-    target_title = None
+    await state.clear()
+    text = (
+        "🤝 <b>Панель работы с блогерами и инфлюенсерами</b>\n\n"
+        "Здесь вы можете создать партнерский промокод для блогера:\n"
+        "• Промокод многоразовый — каждый зритель блогера сможет ввести его 1 раз\n"
+        "• Зритель получает выбранный бонус (например, 7 дней безлимита)\n"
+        "• Зритель <b>навсегда закрепляется</b> за этим блогером\n"
+        "• Блогеру автоматически начисляется <b>20%</b> (с учётом штрафов/бонусов) со всех покупок\n\n"
+        "Выберите действие ниже 👇"
+    )
+    await message.answer(text, parse_mode="HTML", reply_markup=get_admin_blogger_plans_keyboard())
 
-    if len(parts) > 1 and parts[1].strip():
-        target_chat = parts[1].strip()
-    elif message.chat.type in ("group", "supergroup", "channel"):
-        target_chat = str(message.chat.id)
-        target_title = message.chat.title or "Группа"
-    else:
-        await message.answer(
-            "⚠️ <b>Укажите канал или группу для отчётов!</b>\n\n"
-            "Примеры использования:\n"
-            "• <code>/point @my_channel</code> — привязать публичный канал или группу\n"
-            "• <code>/point -1001234567890</code> — привязать по ID\n"
-            "• Или напишите <code>/point</code> прямо внутри группы, куда добавлен бот.",
-            parse_mode="HTML"
-        )
-        return
-
-    if not bot:
-        await message.answer("⚠️ Ошибка: Экземпляр бота не инициализирован.")
-        return
-
-    report_text = format_blogger_stats_text("📊 <b>Активация точки отчётов /point</b>\n\nСтатистика блогеров на данный момент:\n")
-    try:
-        sent_msg = await bot.send_message(target_chat, report_text, parse_mode="HTML")
-        final_chat_id = str(sent_msg.chat.id)
-        if not target_title:
-            target_title = sent_msg.chat.title or sent_msg.chat.username or str(target_chat)
-
-        now_iso = datetime.now().isoformat()
-        query_db("DELETE FROM report_points WHERE chat_id = ?", (final_chat_id,))
-        query_db(
-            "INSERT INTO report_points (chat_id, title, created_at) VALUES (?, ?, ?)",
-            (final_chat_id, target_title, now_iso)
-        )
-
-        await message.answer(
-            f"✅ <b>Точка отчётов успешно активирована!</b>\n\n"
-            f"📍 Канал / Чат: <b>{html.escape(target_title)}</b> (<code>{final_chat_id}</code>)\n"
-            f"📤 Тестовый отчёт со статистикой блогеров уже отправлен туда.\n"
-            f"⏰ <b>Авто-рассылка:</b> каждый вечер ровно в <b>22:00</b> по киевскому времени бот будет присылать туда свежую статистику.\n\n"
-            f"Для отключения используйте: <code>/dellpoint</code>",
-            parse_mode="HTML"
-        )
-    except Exception as e:
-        logger.error(f"Ошибка активации точки {target_chat}: {e}")
-        await message.answer(
-            f"❌ <b>Не удалось отправить отчёт в {html.escape(str(target_chat))}!</b>\n\n"
-            f"Причина: <code>{html.escape(str(e))}</code>\n\n"
-            "Убедитесь, что:\n"
-            "1. Бот добавлен в эту группу/канал как администратор с правами публикации.\n"
-            "2. Указан верный @юзернейм или ID чата.",
-            parse_mode="HTML"
-        )
-
-@dp.message(Command("dellpoint"))
-async def cmd_dellpoint(message: Message):
-    if message.from_user.id != ADMIN_USER_ID:
-        await message.answer("⛔ Данная команда доступна только главному администратору.")
-        return
-
-    parts = message.text.split(maxsplit=1)
-    if len(parts) > 1 and parts[1].strip():
-        arg = parts[1].strip()
-        query_db("DELETE FROM report_points WHERE chat_id = ? OR title = ?", (arg, arg))
-        await message.answer(f"🗑 Точка отчётов <b>{html.escape(arg)}</b> отключена.", parse_mode="HTML")
-        return
-
-    if message.chat.type in ("group", "supergroup", "channel"):
-        cid = str(message.chat.id)
-        query_db("DELETE FROM report_points WHERE chat_id = ?", (cid,))
-        await message.answer("🗑 Эта группа отключена от вечерней рассылки отчётов.", parse_mode="HTML")
-        return
-
-    points = query_db("SELECT * FROM report_points")
-    if not points:
-        await message.answer("ℹ️ Активных точек отчётов не найдено.")
-        return
-
-    query_db("DELETE FROM report_points")
-    await message.answer("🗑 Все точки отчётов (вечерняя рассылка в 22:00) успешно отключены.", parse_mode="HTML")
-
-async def daily_point_scheduler():
-    """Надежный интервальный планировщик: проверяет время каждые 30 секунд и гарантированно шлет отчет в 22:00."""
-    logger.info("Запущен планировщик вечерних отчётов (интервал 30 сек, окно 22:00 Киев).")
-    last_reported_date = ""
-    while True:
-        try:
-            now = datetime.now(KYIV_TZ)
-            today_str = now.strftime("%Y-%m-%d")
-
-            # Окно отправки отчета: если на часах 22:00-22:15 и сегодня еще не отправляли
-            if now.hour == 22 and 0 <= now.minute <= 15 and last_reported_date != today_str:
-                points = query_db("SELECT * FROM report_points")
-                if points and bot:
-                    logger.info(f"Начало отправки вечерних отчётов за {today_str}...")
-                    report_text = format_blogger_stats_text("📊 <b>Ежедневный отчёт по блогерам (22:00 Киев):</b>\n")
-                    for p in points:
-                        cid = p.get("chat_id")
-                        if not cid:
-                            continue
-                        try:
-                            await bot.send_message(cid, report_text, parse_mode="HTML")
-                            logger.info(f"Вечерний отчёт успешно доставлен в {cid} ({p.get('title')})")
-                        except Exception as post_err:
-                            logger.warning(f"Не удалось отправить вечерний отчёт в {cid}: {post_err}")
-                last_reported_date = today_str
-
-            await asyncio.sleep(30)
-        except asyncio.CancelledError:
-            break
-        except Exception as loop_err:
-            logger.error(f"Ошибка в daily_point_scheduler: {loop_err}")
-            await asyncio.sleep(30)
-
-@dp.callback_query(F.data.startswith("blog_plan:"))
-async def cb_select_blogger_plan(callback: CallbackQuery, state: FSMContext):
+@dp.callback_query(F.data == "blog_fine_start")
+async def cb_blog_fine_start(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     if callback.from_user.id != ADMIN_USER_ID:
         return
 
-    plan_key = callback.data.split(":")[1]
-    plan = PLANS.get(plan_key)
-    if not plan:
-        return
-
-    await state.update_data(selected_blog_plan=plan_key)
-    await state.set_state(BloggerPromoFSM.waiting_for_blogger_tag)
-
-    cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="◀️ Отмена", callback_data="back_to_main")]
+    await state.set_state(BloggerFineFSM.waiting_for_blogger_ident)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ Отмена", callback_data="back_to_blog_menu")]
     ])
-
     await callback.message.edit_text(
-        f"📝 <b>Регистрация блогера</b>\n\n"
-        f"Выбранный бонус для зрителей: <b>{html.escape(plan['title'])}</b>\n\n"
-        "Отправьте в ответном сообщении <b>никнейм, имя или канал блогера</b>:\n"
-        "<i>Например: @resale_bro, Vlad Resale или TikTok_Artem</i>",
+        "⚖️ <b>Управление штрафами и ставками блогеров</b>\n\n"
+        "Отправьте в чат <b>@username, имя или промокод блогера</b>, которому хотите изменить процент или выдать штраф на 1 месяц:\n"
+        "<i>Например: @resale_bro или RESALE-7A1B</i>",
         parse_mode="HTML",
-        reply_markup=cancel_kb
+        reply_markup=kb
     )
 
-@dp.message(StateFilter(BloggerPromoFSM.waiting_for_blogger_tag), F.text)
-async def process_blogger_tag_input(message: Message, state: FSMContext):
+@dp.message(StateFilter(BloggerFineFSM.waiting_for_blogger_ident), F.text)
+async def process_blogger_fine_ident(message: Message, state: FSMContext):
     if message.from_user.id != ADMIN_USER_ID:
         return
 
-    blogger_tag = message.text.strip()
-    data = await state.get_data()
-    plan_key = data.get("selected_blog_plan", "sub_7d")
-    plan = PLANS.get(plan_key)
-    await state.clear()
+    raw_val = message.text.strip()
+    tag_with_at = raw_val if raw_val.startswith("@") else f"@{raw_val}"
+    tag_without_at = raw_val.lstrip("@")
 
-    existing = query_db("SELECT * FROM bloggers WHERE tag = ?", (blogger_tag,))
-    if existing:
-        b = existing[0]
+    found = query_db(
+        "SELECT * FROM bloggers WHERE tag = ? OR tag = ? OR promo_code = ?",
+        (tag_with_at, tag_without_at, raw_val.upper())
+    )
+
+    if not found:
         await message.answer(
-            f"⚠️ Блогер <b>{html.escape(blogger_tag)}</b> уже зарегистрирован ранее!\n\n"
-            f"Его промокод: <code>{b['promo_code']}</code>\n"
-            f"Используйте команду <code>/promoblog</code> для просмотра статистики.",
-            parse_mode="HTML",
-            reply_markup=get_admin_blogger_plans_keyboard()
+            f"❌ Блогер с ником или промокодом <b>{html.escape(raw_val)}</b> не найден.\n"
+            "Попробуйте ввести заново или проверьте список через <code>/promoblog</code>:",
+            parse_mode="HTML"
         )
         return
 
-    promo_code = generate_blogger_promo_code(blogger_tag)
-    now_iso = datetime.now().isoformat()
+    blogger = found[0]
+    await state.update_data(fine_blogger_id=blogger["id"], fine_blogger_tag=blogger["tag"])
+    await state.set_state(BloggerFineFSM.waiting_for_fine_value)
+
+    today_str = datetime.now(KYIV_TZ).strftime("%Y-%m-%d")
+    cur_fine = float(blogger.get("fine_percent") or 0.0)
+    fine_until = blogger.get("fine_until")
+    fine_status = f"Активен штраф -{cur_fine:.0f}% до {fine_until}" if (fine_until and fine_until >= today_str and cur_fine > 0) else "Штрафов нет"
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ Отмена", callback_data="back_to_blog_menu")]
+    ])
+
+    await message.answer(
+        f"👤 Выбран блогер: <b>{html.escape(blogger['tag'])}</b>\n"
+        f"Текущий статус: <i>{fine_status}</i> (базовая ставка: {blogger.get('commission_rate', 20.0)}%)\n\n"
+        "Введите величину изменения ставки на <b>1 месяц</b>:\n"
+        "• <code>-10</code> — штраф 10% на месяц (будет получать 10% вместо 20%)\n"
+        "• <code>+5</code> — бонусная надбавка 5% (будет получать 25%)\n"
+        "• <code>0</code> — полностью снять все штрафы и вернуть стандартные 20%",
+        parse_mode="HTML",
+        reply_markup=kb
+    )
+
+@dp.message(StateFilter(BloggerFineFSM.waiting_for_fine_value), F.text)
+async def process_blogger_fine_value(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_USER_ID:
+        return
+
+    data = await state.get_data()
+    blogger_id = data.get("fine_blogger_id")
+    blogger_tag = data.get("fine_blogger_tag")
+    await state.clear()
+
+    text_val = message.text.strip().replace("%", "")
+    try:
+        val = float(text_val)
+    except ValueError:
+        await message.answer("⚠️ Введите число (например <code>-10</code>, <code>+5</code> или <code>0</code>). Попробуйте заново через меню.")
+        return
+
+    now = datetime.now(KYIV_TZ)
+    today_str = now.strftime("%Y-%m-%d")
+    month_later_str = (now + timedelta(days=30)).strftime("%Y-%m-%d")
+
+    if val < 0:
+        fine_percent = abs(val)
+        query_db(
+            "UPDATE bloggers SET fine_percent = ?, fine_until = ? WHERE id = ?",
+            (fine_percent, month_later_str, blogger_id)
+        )
+        msg = (
+            f"⚖️ <b>Штраф успешно назначен!</b>\n\n"
+            f"👤 Блогер: <b>{html.escape(str(blogger_tag))}</b>\n"
+            f"📉 Штраф: <b>-{fine_percent:.0f}%</b> от комиссии\n"
+            f"⏳ Срок действия: <b>1 месяц</b> (до {month_later_str})\n"
+            f"📊 Итоговая ставка на период штрафа: <b>{max(0.0, 20.0 - fine_percent):.0f}%</b>"
+        )
+    elif val == 0:
+        query_db(
+            "UPDATE bloggers SET fine_percent = 0.0, fine_until = NULL, commission_rate = 20.0 WHERE id = ?",
+            (blogger_id,)
+        )
+        msg = (
+            f"✅ <b>Штрафы сняты!</b>\n\n"
+            f"👤 Блогер: <b>{html.escape(str(blogger_tag))}</b>\n"
+            "Ставка комиссии возвращена на стандартные <b>20%</b>."
+        )
+    else:
+        new_rate = 20.0 + val
+        query_db(
+            "UPDATE bloggers SET commission_rate = ?, fine_percent = 0.0, fine_until = NULL WHERE id = ?",
+            (new_rate, blogger_id)
+        )
+        msg = (
+            f"🚀 <b>Ставка повышена!</b>\n\n"
+            f"👤 Блогер: <b>{html.escape(str(blogger_tag))}</b>\n"
+            f"📈 Новая ставка: <b>{new_rate:.0f}%</b>"
+        )
+
+    await message.answer(msg, parse_mode="HTML", reply_markup=get_admin_blogger_plans_keyboard())
+
+@dp.callback_query(F.data == "blog_payout_start")
+async def cb_blog_payout_start(callback: CallbackQuery):
+    await callback.answer()
+    if callback.from_user.id != ADMIN_USER_ID:
+        return
+
+    bloggers = query_db("SELECT * FROM bloggers ORDER BY id DESC")
+    if not bloggers:
+        await callback.message.edit_text("ℹ️ В системе пока нет зарегистрированных блогеров.", reply_markup=get_admin_blogger_plans_keyboard())
+        return
+
+    buttons = []
+    for b in bloggers:
+        uah = float(b.get("earnings_uah") or 0.0)
+        stars = int(b.get("earnings_stars") or 0)
+        btn_text = f"💸 {b['tag']} — {uah:.2f} грн | {stars} ⭐"
+        buttons.append([InlineKeyboardButton(text=btn_text, callback_data=f"payout_ask:{b['id']}")])
+
+    buttons.append([InlineKeyboardButton(text="◀️ Назад в меню", callback_data="back_to_blog_menu")])
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    await callback.message.edit_text(
+        "💸 <b>Фиксация выплаты и обнуление баланса</b>\n\n"
+        "Выберите блогера, которому вы перевели деньги, чтобы подтвердить выплату и обнулить накопленный счетчик 👇",
+        parse_mode="HTML",
+        reply_markup=kb
+    )
+
+@dp.callback_query(F.data.startswith("payout_ask:"))
+async def cb_payout_ask(callback: CallbackQuery):
+    await callback.answer()
+    if callback.from_user.id != ADMIN_USER_ID:
+        return
+
+    b_id = int(callback.data.split(":")[1])
+    found = query_db("SELECT * FROM bloggers WHERE id = ?", (b_id,))
+    if not found:
+        await callback.message.answer("❌ Блогер не найден.")
+        return
+
+    blogger = found[0]
+    uah = float(blogger.get("earnings_uah") or 0.0)
+    stars = int(blogger.get("earnings_stars") or 0)
+
+    confirm_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"✅ Подтвердить выплату ({uah:.2f} грн / {stars} ⭐)", callback_data=f"payout_confirm:{b_id}")],
+        [InlineKeyboardButton(text="◀️ Отмена", callback_data="blog_payout_start")]
+    ])
+
+    await callback.message.edit_text(
+        f"⚠️ <b>Подтверждение выплаты блогеру:</b>\n\n"
+        f"👤 Блогер: <b>{html.escape(blogger['tag'])}</b>\n"
+        f"💰 Накопленная сумма: <b>{uah:.2f} грн</b> | <b>{stars} ⭐</b>\n\n"
+        "После нажатия кнопки баланс блогера <b>обнулится до 0</b>, а выплаченная сумма запишется в историю общих выплат блогеру.",
+        parse_mode="HTML",
+        reply_markup=confirm_kb
+    )
+
+@dp.callback_query(F.data.startswith("payout_confirm:"))
+async def cb_payout_confirm(callback: CallbackQuery):
+    await callback.answer()
+    if callback.from_user.id != ADMIN_USER_ID:
+        return
+
+    b_id = int(callback.data.split(":")[1])
+    found = query_db("SELECT * FROM bloggers WHERE id = ?", (b_id,))
+    if not found:
+        await callback.message.answer("❌ Блогер не найден.")
+        return
+
+    blogger = found[0]
+    cur_uah = float(blogger.get("earnings_uah") or 0.0)
+    cur_stars = int(blogger.get("earnings_stars") or 0)
+    total_paid_uah = float(blogger.get("total_paid_uah") or 0.0) + cur_uah
+    total_paid_stars = int(blogger.get("total_paid_stars") or 0) + cur_stars
 
     query_db(
-        """INSERT INTO bloggers (tag, promo_code, plan_id, created_at, earnings_uah, earnings_stars, total_referrals)
-           VALUES (?, ?, ?, ?, 0.0, 0, 0)""",
-        (blogger_tag, promo_code, plan_key, now_iso)
+        """UPDATE bloggers 
+           SET earnings_uah = 0.0, 
+               earnings_stars = 0, 
+               total_paid_uah = ?, 
+               total_paid_stars = ? 
+           WHERE id = ?""",
+        (total_paid_uah, total_paid_stars, b_id)
     )
 
-    reply_text = (
-        "✅ <b>Блогер успешно зарегистрирован!</b>\n\n"
-        f"👤 Блогер: <b>{html.escape(blogger_tag)}</b>\n"
-        f"🎟 Промокод для видео: <code>{promo_code}</code> (нажмите, чтобы скопировать)\n"
-        f"🎁 Подарок для аудитории: <b>{html.escape(plan['title'])}</b>\n"
-        f"💸 Комиссия блогеру: <b>20%</b> со всех платежей его рефералов\n\n"
-        "Передайте этот промокод блогеру. Когда его зрители будут покупать тарифы, "
-        "бот будет автоматически присылать вам уведомления и подсчитывать баланс блогера."
+    success_msg = (
+        f"🎉 <b>Выплата зафиксирована, баланс обнулен!</b>\n\n"
+        f"👤 Блогер: <b>{html.escape(blogger['tag'])}</b>\n"
+        f"💵 Выплачено в этот раз: <b>{cur_uah:.2f} грн</b> | <b>{cur_stars} ⭐</b>\n"
+        f"📈 Всего выплачено за всё время: <b>{total_paid_uah:.2f} грн</b> | <b>{total_paid_stars} ⭐</b>\n\n"
+        f"Текущий баланс блогера: <b>0.00 грн</b> | <b>0 ⭐</b>"
     )
-    await message.answer(reply_text, parse_mode="HTML", reply_markup=get_admin_blogger_plans_keyboard())
+
+    await callback.message.edit_text(success_msg, parse_mode="HTML", reply_markup=get_admin_blogger_plans_keyboard())
 
 @dp.callback_query(F.data == "blog_stats")
 async def cb_show_blogger_stats(callback: CallbackQuery):
