@@ -1470,170 +1470,6 @@ def generate_blogger_promo_code(blogger_prefix: str) -> str:
     random_part = "".join(secrets.choice(chars) for _ in range(4))
     return f"{clean_prefix}-{random_part}"
 
-def get_admin_blogger_plans_keyboard():
-    buttons = []
-    for plan_key, plan in PLANS.items():
-        buttons.append([InlineKeyboardButton(text=f"🎁 {plan['title']}", callback_data=f"blog_plan:{plan_key}")])
-    buttons.append([InlineKeyboardButton(text="📊 Список блогеров и статистика (20%)", callback_data="blog_stats")])
-    buttons.append([InlineKeyboardButton(text="◀️ В меню", callback_data="back_to_main")])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-@dp.message(Command("promoblog"))
-async def cmd_promoblog(message: Message, state: FSMContext):
-    if message.from_user.id != ADMIN_USER_ID:
-        await message.answer("⛔ Данная команда доступна только главному администратору.")
-        return
-
-    await state.clear()
-    text = (
-        "🤝 <b>Панель работы с блогерами и инфлюенсерами</b>\n\n"
-        "Здесь вы можете создать партнерский промокод для блогера:\n"
-        "• Промокод многоразовый — каждый зритель блогера сможет ввести его 1 раз\n"
-        "• Зритель получает выбранный бонус (например, 7 дней безлимита)\n"
-        "• Зритель <b>навсегда закрепляется</b> за этим блогером\n"
-        "• Блогеру автоматически начисляется <b>20%</b> со всех будущих покупок его зрителей\n\n"
-        "Выберите тариф-бонус, который получит аудитория блогера 👇"
-    )
-    await message.answer(text, parse_mode="HTML", reply_markup=get_admin_blogger_plans_keyboard())
-
-@dp.message(Command("dellblog"))
-async def cmd_dellblog(message: Message):
-    if message.from_user.id != ADMIN_USER_ID:
-        await message.answer("⛔ Данная команда доступна только главному администратору.")
-        return
-
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2 or not parts[1].strip():
-        await message.answer(
-            "⚠️ <b>Укажите ник или промокод блогера для удаления!</b>\n\n"
-            "Пример использования:\n"
-            "<code>/dellblog @resale_bro</code> или <code>/dellblog RESALE-7A1B</code>",
-            parse_mode="HTML"
-        )
-        return
-
-    raw_tag = parts[1].strip()
-    tag_with_at = raw_tag if raw_tag.startswith("@") else f"@{raw_tag}"
-    tag_without_at = raw_tag.lstrip("@")
-
-    # Поиск по тегу с @, без @ или по прямому промокоду
-    found = query_db(
-        "SELECT * FROM bloggers WHERE tag = ? OR tag = ? OR promo_code = ?",
-        (tag_with_at, tag_without_at, raw_tag.upper())
-    )
-
-    if not found:
-        await message.answer(
-            f"❌ Блогер с ником или промокодом <b>{html.escape(raw_tag)}</b> не найден в базе данных.",
-            parse_mode="HTML"
-        )
-        return
-
-    blogger = found[0]
-    b_id = blogger["id"]
-    b_tag = blogger.get("tag", raw_tag)
-    b_code = blogger.get("promo_code", "НЕТ")
-
-    # Удаляем блогера и очищаем связанные записи
-    query_db("DELETE FROM bloggers WHERE id = ?", (b_id,))
-    query_db("DELETE FROM blogger_promo_uses WHERE blogger_id = ?", (b_id,))
-
-    await message.answer(
-        f"🗑 <b>Блогер успешно удален!</b>\n\n"
-        f"👤 Никнейм: <b>{html.escape(str(b_tag))}</b>\n"
-        f"🎟 Промокод <code>{b_code}</code> отключен.\n\n"
-        f"Проверить актуальный список: <code>/promoblog</code>",
-        parse_mode="HTML"
-    )
-
-def get_info_stats_text() -> str:
-    """Формирует отчет по пользователям за все время и за текущий день."""
-    today_str = datetime.now(KYIV_TZ).strftime("%Y-%m-%d")
-    today_formatted = datetime.now(KYIV_TZ).strftime("%d.%m.%Y")
-
-    # 1. Всего пользователей в базе
-    total_users_rows = query_db("SELECT COUNT(*) as cnt FROM users")
-    total_users = total_users_rows[0].get("cnt", 0) if total_users_rows else 0
-
-    # 2. Уникальные пользователи, воспользовавшиеся ботом сегодня
-    log_users_rows = query_db(
-        "SELECT COUNT(DISTINCT user_id) as cnt FROM usage_logs WHERE action_date = ?",
-        (today_str,)
-    )
-    logged_today = log_users_rows[0].get("cnt", 0) if log_users_rows else 0
-
-    user_today_rows = query_db(
-        "SELECT COUNT(DISTINCT user_id) as cnt FROM users WHERE last_check_date = ? AND checks_today > 0",
-        (today_str,)
-    )
-    users_today = user_today_rows[0].get("cnt", 0) if user_today_rows else 0
-
-    active_today = max(logged_today, users_today)
-
-    # 3. Всего проверок вещей за сегодня
-    total_checks_rows = query_db(
-        "SELECT COUNT(*) as cnt FROM usage_logs WHERE action_date = ?",
-        (today_str,)
-    )
-    checks_count_today = total_checks_rows[0].get("cnt", 0) if total_checks_rows else 0
-
-    # 4. Общая касса платежей за всё время
-    pay_rows = query_db(
-        "SELECT currency, SUM(amount) as s FROM payments WHERE status = 'success' GROUP BY currency"
-    )
-    total_uah = 0.0
-    total_stars = 0
-    for r in pay_rows:
-        curr = str(r.get("currency") or "").upper()
-        amt = float(r.get("s") or 0.0)
-        if curr == "UAH":
-            total_uah = amt
-        elif curr == "XTR":
-            total_stars = int(amt)
-
-    checks_line = f"• Проверок вещей сделано сегодня: <b>{checks_count_today} шт.</b>\n" if checks_count_today > 0 else ""
-
-    return (
-        "📊 <b>Статистика бота (/info)</b>\n\n"
-        f"📅 Дата: <b>{today_formatted}</b> (Киев)\n\n"
-        "👥 <b>Пользователи:</b>\n"
-        f"• Всего зарегистрировано: <b>{total_users} чел.</b>\n"
-        f"• Воспользовались ботом сегодня: <b>{active_today} чел.</b>\n"
-        f"{checks_line}\n"
-        "💰 <b>Касса за всё время:</b>\n"
-        f"• 💳 Монобанк: <b>{total_uah:.2f} грн</b>\n"
-        f"• ⭐ Telegram Stars: <b>{total_stars} ⭐</b>\n\n"
-        f"🕒 <i>Обновлено: {datetime.now(KYIV_TZ).strftime('%H:%M:%S')}</i>"
-    )
-
-def get_info_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Обновить", callback_data="refresh_info")],
-        [InlineKeyboardButton(text="◀️ В главное меню", callback_data="back_to_main")]
-    ])
-
-@dp.message(Command("info"))
-async def cmd_info(message: Message):
-    if message.from_user.id != ADMIN_USER_ID:
-        await message.answer("⛔ Данная команда доступна только главному администратору.")
-        return
-
-    text = get_info_stats_text()
-    await message.answer(text, parse_mode="HTML", reply_markup=get_info_keyboard())
-
-@dp.callback_query(F.data == "refresh_info")
-async def cb_refresh_info(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_USER_ID:
-        await callback.answer("⛔ Доступно только администратору.", show_alert=True)
-        return
-
-    await callback.answer("Обновляю данные...")
-    text = get_info_stats_text()
-    try:
-        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=get_info_keyboard())
-    except Exception:
-        pass
-
 def format_blogger_stats_text(header: str = "📊 <b>Партнёрская статистика блогеров (20%):</b>\n") -> str:
     """Форматирует полную сводку блогеров и начислений для отправки в каналы или админу."""
     bloggers = query_db("SELECT * FROM bloggers ORDER BY id DESC")
@@ -1726,6 +1562,124 @@ async def cmd_promoblog(message: Message, state: FSMContext):
     )
     await message.answer(text, parse_mode="HTML", reply_markup=get_admin_blogger_plans_keyboard())
 
+@dp.callback_query(F.data.startswith("blog_plan:"))
+async def cb_select_blogger_plan(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    if callback.from_user.id != ADMIN_USER_ID:
+        return
+
+    plan_key = callback.data.split(":")[1]
+    plan = PLANS.get(plan_key)
+    if not plan:
+        return
+
+    await state.update_data(selected_blog_plan=plan_key)
+    await state.set_state(BloggerPromoFSM.waiting_for_blogger_tag)
+
+    cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ Отмена", callback_data="back_to_main")]
+    ])
+
+    await callback.message.edit_text(
+        f"📝 <b>Регистрация блогера</b>\n\n"
+        f"Выбранный бонус для зрителей: <b>{html.escape(plan['title'])}</b>\n\n"
+        "Отправьте в ответном сообщении <b>никнейм, имя или канал блогера</b>:\n"
+        "<i>Например: @resale_bro, Vlad Resale или TikTok_Artem</i>",
+        parse_mode="HTML",
+        reply_markup=cancel_kb
+    )
+
+@dp.message(StateFilter(BloggerPromoFSM.waiting_for_blogger_tag), F.text)
+async def process_blogger_tag_input(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_USER_ID:
+        return
+
+    blogger_tag = message.text.strip()
+    data = await state.get_data()
+    plan_key = data.get("selected_blog_plan", "sub_7d")
+    plan = PLANS.get(plan_key)
+    await state.clear()
+
+    existing = query_db("SELECT * FROM bloggers WHERE tag = ?", (blogger_tag,))
+    if existing:
+        b = existing[0]
+        await message.answer(
+            f"⚠️ Блогер <b>{html.escape(blogger_tag)}</b> уже зарегистрирован ранее!\n\n"
+            f"Его промокод: <code>{b['promo_code']}</code>\n"
+            f"Используйте команду <code>/promoblog</code> для просмотра статистики.",
+            parse_mode="HTML",
+            reply_markup=get_admin_blogger_plans_keyboard()
+        )
+        return
+
+    promo_code = generate_blogger_promo_code(blogger_tag)
+    now_iso = datetime.now().isoformat()
+
+    query_db(
+        """INSERT INTO bloggers (tag, promo_code, plan_id, created_at, earnings_uah, earnings_stars, total_referrals)
+           VALUES (?, ?, ?, ?, 0.0, 0, 0)""",
+        (blogger_tag, promo_code, plan_key, now_iso)
+    )
+
+    reply_text = (
+        "✅ <b>Блогер успешно зарегистрирован!</b>\n\n"
+        f"👤 Блогер: <b>{html.escape(blogger_tag)}</b>\n"
+        f"🎟 Промокод для видео: <code>{promo_code}</code> (нажмите, чтобы скопировать)\n"
+        f"🎁 Подарок для аудитории: <b>{html.escape(plan['title'])}</b>\n"
+        f"💸 Комиссия блогеру: <b>20%</b> со всех платежей его рефералов\n\n"
+        "Передайте этот промокод блогеру. Когда его зрители будут покупать тарифы, "
+        "бот будет автоматически присылать вам уведомления и подсчитывать баланс блогера."
+    )
+    await message.answer(reply_text, parse_mode="HTML", reply_markup=get_admin_blogger_plans_keyboard())
+
+@dp.message(Command("dellblog"))
+async def cmd_dellblog(message: Message):
+    if message.from_user.id != ADMIN_USER_ID:
+        await message.answer("⛔ Данная команда доступна только главному администратору.")
+        return
+
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.answer(
+            "⚠️ <b>Укажите ник или промокод блогера для удаления!</b>\n\n"
+            "Пример использования:\n"
+            "<code>/dellblog @resale_bro</code> или <code>/dellblog RESALE-7A1B</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    raw_tag = parts[1].strip()
+    tag_with_at = raw_tag if raw_tag.startswith("@") else f"@{raw_tag}"
+    tag_without_at = raw_tag.lstrip("@")
+
+    found = query_db(
+        "SELECT * FROM bloggers WHERE tag = ? OR tag = ? OR promo_code = ?",
+        (tag_with_at, tag_without_at, raw_tag.upper())
+    )
+
+    if not found:
+        await message.answer(
+            f"❌ Блогер с ником или промокодом <b>{html.escape(raw_tag)}</b> не найден в базе данных.",
+            parse_mode="HTML"
+        )
+        return
+
+    blogger = found[0]
+    b_id = blogger["id"]
+    b_tag = blogger.get("tag", raw_tag)
+    b_code = blogger.get("promo_code", "НЕТ")
+
+    query_db("DELETE FROM bloggers WHERE id = ?", (b_id,))
+    query_db("DELETE FROM blogger_promo_uses WHERE blogger_id = ?", (b_id,))
+
+    await message.answer(
+        f"🗑 <b>Блогер успешно удален!</b>\n\n"
+        f"👤 Никнейм: <b>{html.escape(str(b_tag))}</b>\n"
+        f"🎟 Промокод <code>{b_code}</code> отключен.\n\n"
+        f"Проверить актуальный список: <code>/promoblog</code>",
+        parse_mode="HTML"
+    )
+
 @dp.callback_query(F.data == "blog_fine_start")
 async def cb_blog_fine_start(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
@@ -1808,7 +1762,6 @@ async def process_blogger_fine_value(message: Message, state: FSMContext):
         return
 
     now = datetime.now(KYIV_TZ)
-    today_str = now.strftime("%Y-%m-%d")
     month_later_str = (now + timedelta(days=30)).strftime("%Y-%m-%d")
 
     if val < 0:
@@ -1964,6 +1917,212 @@ async def cb_back_to_blog_menu(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     await state.clear()
     await cmd_promoblog(callback.message, state)
+
+@dp.message(Command("point"))
+async def cmd_point(message: Message):
+    if message.from_user.id != ADMIN_USER_ID:
+        await message.answer("⛔ Данная команда доступна только главному администратору.")
+        return
+
+    parts = message.text.split(maxsplit=1)
+    target_chat = None
+    target_title = None
+
+    if len(parts) > 1 and parts[1].strip():
+        target_chat = parts[1].strip()
+    elif message.chat.type in ("group", "supergroup", "channel"):
+        target_chat = str(message.chat.id)
+        target_title = message.chat.title or "Группа"
+    else:
+        await message.answer(
+            "⚠️ <b>Укажите канал или группу для отчётов!</b>\n\n"
+            "Примеры использования:\n"
+            "• <code>/point @my_channel</code> — привязать публичный канал или группу\n"
+            "• <code>/point -1001234567890</code> — привязать по ID\n"
+            "• Или напишите <code>/point</code> прямо внутри группы, куда добавлен бот.",
+            parse_mode="HTML"
+        )
+        return
+
+    if not bot:
+        await message.answer("⚠️ Ошибка: Экземпляр бота не инициализирован.")
+        return
+
+    report_text = format_blogger_stats_text("📊 <b>Активация точки отчётов /point</b>\n\nСтатистика блогеров на данный момент:\n")
+    try:
+        sent_msg = await bot.send_message(target_chat, report_text, parse_mode="HTML")
+        final_chat_id = str(sent_msg.chat.id)
+        if not target_title:
+            target_title = sent_msg.chat.title or sent_msg.chat.username or str(target_chat)
+
+        now_iso = datetime.now().isoformat()
+        query_db("DELETE FROM report_points WHERE chat_id = ?", (final_chat_id,))
+        query_db(
+            "INSERT INTO report_points (chat_id, title, created_at) VALUES (?, ?, ?)",
+            (final_chat_id, target_title, now_iso)
+        )
+
+        await message.answer(
+            f"✅ <b>Точка отчётов успешно активирована!</b>\n\n"
+            f"📍 Канал / Чат: <b>{html.escape(target_title)}</b> (<code>{final_chat_id}</code>)\n"
+            f"📤 Тестовый отчёт со статистикой блогеров уже отправлен туда.\n"
+            f"⏰ <b>Авто-рассылка:</b> каждый вечер ровно в <b>22:00</b> по киевскому времени бот будет присылать туда свежую статистику.\n\n"
+            f"Для отключения используйте: <code>/dellpoint</code>",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.error(f"Ошибка активации точки {target_chat}: {e}")
+        await message.answer(
+            f"❌ <b>Не удалось отправить отчёт в {html.escape(str(target_chat))}!</b>\n\n"
+            f"Причина: <code>{html.escape(str(e))}</code>\n\n"
+            "Убедитесь, что:\n"
+            "1. Бот добавлен в эту группу/канал как администратор с правами публикации.\n"
+            "2. Указан верный @юзернейм или ID чата.",
+            parse_mode="HTML"
+        )
+
+@dp.message(Command("dellpoint"))
+async def cmd_dellpoint(message: Message):
+    if message.from_user.id != ADMIN_USER_ID:
+        await message.answer("⛔ Данная команда доступна только главному администратору.")
+        return
+
+    parts = message.text.split(maxsplit=1)
+    if len(parts) > 1 and parts[1].strip():
+        arg = parts[1].strip()
+        query_db("DELETE FROM report_points WHERE chat_id = ? OR title = ?", (arg, arg))
+        await message.answer(f"🗑 Точка отчётов <b>{html.escape(arg)}</b> отключена.", parse_mode="HTML")
+        return
+
+    if message.chat.type in ("group", "supergroup", "channel"):
+        cid = str(message.chat.id)
+        query_db("DELETE FROM report_points WHERE chat_id = ?", (cid,))
+        await message.answer("🗑 Эта группа отключена от вечерней рассылки отчётов.", parse_mode="HTML")
+        return
+
+    points = query_db("SELECT * FROM report_points")
+    if not points:
+        await message.answer("ℹ️ Активных точек отчётов не найдено.")
+        return
+
+    query_db("DELETE FROM report_points")
+    await message.answer("🗑 Все точки отчётов (вечерняя рассылка в 22:00) успешно отключены.", parse_mode="HTML")
+
+async def daily_point_scheduler():
+    """Надежный интервальный планировщик: проверяет время каждые 30 секунд и гарантированно шлет отчет в 22:00."""
+    logger.info("Запущен планировщик вечерних отчётов (интервал 30 сек, окно 22:00 Киев).")
+    last_reported_date = ""
+    while True:
+        try:
+            now = datetime.now(KYIV_TZ)
+            today_str = now.strftime("%Y-%m-%d")
+
+            if now.hour == 22 and 0 <= now.minute <= 15 and last_reported_date != today_str:
+                points = query_db("SELECT * FROM report_points")
+                if points and bot:
+                    logger.info(f"Начало отправки вечерних отчётов за {today_str}...")
+                    report_text = format_blogger_stats_text("📊 <b>Ежедневный отчёт по блогерам (22:00 Киев):</b>\n")
+                    for p in points:
+                        cid = p.get("chat_id")
+                        if not cid:
+                            continue
+                        try:
+                            await bot.send_message(cid, report_text, parse_mode="HTML")
+                            logger.info(f"Вечерний отчёт успешно доставлен в {cid} ({p.get('title')})")
+                        except Exception as post_err:
+                            logger.warning(f"Не удалось отправить вечерний отчёт в {cid}: {post_err}")
+                last_reported_date = today_str
+
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            break
+        except Exception as loop_err:
+            logger.error(f"Ошибка в daily_point_scheduler: {loop_err}")
+            await asyncio.sleep(30)
+
+def get_info_stats_text() -> str:
+    """Формирует отчет по пользователям за все время и за текущий день."""
+    today_str = datetime.now(KYIV_TZ).strftime("%Y-%m-%d")
+    today_formatted = datetime.now(KYIV_TZ).strftime("%d.%m.%Y")
+
+    total_users_rows = query_db("SELECT COUNT(*) as cnt FROM users")
+    total_users = total_users_rows[0].get("cnt", 0) if total_users_rows else 0
+
+    log_users_rows = query_db(
+        "SELECT COUNT(DISTINCT user_id) as cnt FROM usage_logs WHERE action_date = ?",
+        (today_str,)
+    )
+    logged_today = log_users_rows[0].get("cnt", 0) if log_users_rows else 0
+
+    user_today_rows = query_db(
+        "SELECT COUNT(DISTINCT user_id) as cnt FROM users WHERE last_check_date = ? AND checks_today > 0",
+        (today_str,)
+    )
+    users_today = user_today_rows[0].get("cnt", 0) if user_today_rows else 0
+
+    active_today = max(logged_today, users_today)
+
+    total_checks_rows = query_db(
+        "SELECT COUNT(*) as cnt FROM usage_logs WHERE action_date = ?",
+        (today_str,)
+    )
+    checks_count_today = total_checks_rows[0].get("cnt", 0) if total_checks_rows else 0
+
+    pay_rows = query_db(
+        "SELECT currency, SUM(amount) as s FROM payments WHERE status = 'success' GROUP BY currency"
+    )
+    total_uah = 0.0
+    total_stars = 0
+    for r in pay_rows:
+        curr = str(r.get("currency") or "").upper()
+        amt = float(r.get("s") or 0.0)
+        if curr == "UAH":
+            total_uah = amt
+        elif curr == "XTR":
+            total_stars = int(amt)
+
+    checks_line = f"• Проверок вещей сделано сегодня: <b>{checks_count_today} шт.</b>\n" if checks_count_today > 0 else ""
+
+    return (
+        "📊 <b>Статистика бота (/info)</b>\n\n"
+        f"📅 Дата: <b>{today_formatted}</b> (Киев)\n\n"
+        "👥 <b>Пользователи:</b>\n"
+        f"• Всего зарегистрировано: <b>{total_users} чел.</b>\n"
+        f"• Воспользовались ботом сегодня: <b>{active_today} чел.</b>\n"
+        f"{checks_line}\n"
+        "💰 <b>Касса за всё время:</b>\n"
+        f"• 💳 Монобанк: <b>{total_uah:.2f} грн</b>\n"
+        f"• ⭐ Telegram Stars: <b>{total_stars} ⭐</b>\n\n"
+        f"🕒 <i>Обновлено: {datetime.now(KYIV_TZ).strftime('%H:%M:%S')}</i>"
+    )
+
+def get_info_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="refresh_info")],
+        [InlineKeyboardButton(text="◀️ В главное меню", callback_data="back_to_main")]
+    ])
+
+@dp.message(Command("info"))
+async def cmd_info(message: Message):
+    if message.from_user.id != ADMIN_USER_ID:
+        await message.answer("⛔ Данная команда доступна только главному администратору.")
+        return
+
+    text = get_info_stats_text()
+    await message.answer(text, parse_mode="HTML", reply_markup=get_info_keyboard())
+
+@dp.callback_query(F.data == "refresh_info")
+async def cb_refresh_info(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_USER_ID:
+        await callback.answer("⛔ Доступно только администратору.", show_alert=True)
+        return
+
+    await callback.answer("Обновляю данные...")
+    text = get_info_stats_text()
+    try:
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=get_info_keyboard())
+    except Exception:
+        pass
 
 @dp.message(Command("promo"))
 async def cmd_promo(message: Message):
