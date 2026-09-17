@@ -646,6 +646,10 @@ class BloggerFineFSM(StatesGroup):
     waiting_for_blogger_ident = State()
     waiting_for_fine_value = State()
 
+class BroadcastFSM(StatesGroup):
+    waiting_for_message = State()
+    confirm = State()
+
 USER_SALES_CARDS: dict[int, str] = {}
 USER_CHECK_DATA: dict[int, dict] = {}
 
@@ -2223,6 +2227,137 @@ async def cb_refresh_info(callback: CallbackQuery):
         await callback.message.edit_text(text, parse_mode="HTML", reply_markup=get_info_keyboard())
     except Exception:
         pass
+
+@dp.message(Command("rass"))
+async def cmd_rass(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_USER_ID:
+        await message.answer("⛔ Данная команда доступна только главному администратору.")
+        return
+
+    await state.clear()
+    await state.set_state(BroadcastFSM.waiting_for_message)
+
+    cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ Отмена", callback_data="cancel_broadcast")]
+    ])
+
+    await message.answer(
+        "📢 <b>Рассылка сообщений всем пользователям</b>\n\n"
+        "Отправьте сообщение (текст, фото с описанием, видео, голосовое или пересланный пост), "
+        "которое необходимо разослать каждому пользователю бота:",
+        parse_mode="HTML",
+        reply_markup=cancel_kb
+    )
+
+@dp.callback_query(F.data == "cancel_broadcast")
+async def cb_cancel_broadcast(callback: CallbackQuery, state: FSMContext):
+    await callback.answer("Рассылка отменена.")
+    await state.clear()
+    try:
+        await callback.message.edit_text("❌ Рассылка отменена.", reply_markup=None)
+    except Exception:
+        pass
+
+@dp.message(StateFilter(BroadcastFSM.waiting_for_message))
+async def process_broadcast_message_input(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_USER_ID:
+        return
+
+    rows = query_db("SELECT COUNT(DISTINCT user_id) as cnt FROM users")
+    total_users = rows[0].get("cnt", 0) if rows else 0
+
+    await state.update_data(broadcast_msg_id=message.message_id, broadcast_chat_id=message.chat.id)
+    await state.set_state(BroadcastFSM.confirm)
+
+    confirm_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text=f"🚀 Отправить ({total_users} чел.)", callback_data="confirm_send_broadcast"),
+            InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_broadcast")
+        ]
+    ])
+
+    await message.reply(
+        f"⚠️ <b>Подтверждение рассылки</b>\n\n"
+        f"👥 Всего получателей в базе: <b>{total_users} чел.</b>\n\n"
+        "Сообщение выше будет доставлено каждому пользователю с сохранением форматирования и медиа.\n"
+        "Запустить отправку?",
+        parse_mode="HTML",
+        reply_markup=confirm_kb
+    )
+
+@dp.callback_query(StateFilter(BroadcastFSM.confirm), F.data == "confirm_send_broadcast")
+async def cb_confirm_broadcast(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    if callback.from_user.id != ADMIN_USER_ID:
+        return
+
+    data = await state.get_data()
+    msg_id = data.get("broadcast_msg_id")
+    from_chat_id = data.get("broadcast_chat_id")
+    await state.clear()
+
+    if not msg_id or not from_chat_id or not bot:
+        await callback.message.answer("⚠️ Ошибка: сообщение для рассылки не найдено.")
+        return
+
+    progress_msg = await callback.message.edit_text(
+        "⏳ <b>Рассылка запущена...</b>\nПожалуйста, подождите завершения отправки.",
+        parse_mode="HTML"
+    )
+
+    users = query_db("SELECT DISTINCT user_id FROM users")
+    total = len(users)
+    sent_count = 0
+    blocked_count = 0
+    error_count = 0
+
+    for idx, u in enumerate(users, 1):
+        uid = u.get("user_id")
+        if not uid:
+            continue
+        try:
+            await bot.copy_message(
+                chat_id=uid,
+                from_chat_id=from_chat_id,
+                message_id=msg_id
+            )
+            sent_count += 1
+        except Exception as e:
+            err_text = str(e).lower()
+            if "forbidden" in err_text or "blocked" in err_text or "deactivated" in err_text:
+                blocked_count += 1
+            else:
+                error_count += 1
+
+        # Задержка для соблюдения лимитов Telegram API (до 30 сообщений в секунду)
+        await asyncio.sleep(0.04)
+
+        if idx % 50 == 0 and progress_msg:
+            try:
+                await progress_msg.edit_text(
+                    f"⏳ <b>Рассылка в процессе...</b>\n\n"
+                    f"Прогресс: <b>{idx}/{total}</b> ({int(idx / total * 100)}%)\n"
+                    f"✅ Доставлено: <b>{sent_count}</b>\n"
+                    f"🚫 Заблокировали: <b>{blocked_count}</b>\n"
+                    f"⚠️ Ошибок: <b>{error_count}</b>",
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass
+
+    result_text = (
+        "🎉 <b>Рассылка успешно завершена!</b>\n\n"
+        f"👥 Всего пользователей в базе: <b>{total}</b>\n"
+        f"📨 Успешно доставлено: <b>{sent_count}</b>\n"
+        f"🚫 Заблокировали бота / аккаунты удалены: <b>{blocked_count}</b>\n"
+        f"⚠️ Других ошибок: <b>{error_count}</b>"
+    )
+
+    if progress_msg:
+        try:
+            await progress_msg.edit_text(result_text, parse_mode="HTML")
+        except Exception:
+            await callback.message.answer(result_text, parse_mode="HTML")
 
 @dp.message(Command("promo"))
 async def cmd_promo(message: Message):
