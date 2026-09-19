@@ -53,6 +53,9 @@ if not RAW_JAR_URL.startswith("http"):
 MONOBANK_JAR_URL = RAW_JAR_URL
 MONOBANK_TOKEN = os.getenv("MONOBANK_TOKEN", "").strip()
 
+CACHED_JAR_ACCOUNT: Optional[str] = None
+CHECKING_PAYMENTS: set[int] = set()
+
 FREE_CHECKS_PER_DAY = 3
 DB_NAME = "resale_bot.db"
 
@@ -1290,51 +1293,93 @@ async def cb_pay_mono(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("check_mono:"))
 async def cb_check_monobank_statement(callback: CallbackQuery):
-    await callback.answer("Проверяю поступления на Банку...", show_alert=False)
+    global CACHED_JAR_ACCOUNT
     plan_key = callback.data.split(":")[1]
     plan = PLANS.get(plan_key)
     user_id = callback.from_user.id
 
-    if not MONOBANK_TOKEN:
-        await callback.message.answer(
-            "⚠️ Авто-проверка через API не подключена.\n\n"
-            "Нажмите кнопку <b>«📩 Я оплатил (Отправить чек админу)»</b>, чтобы администратор активировал доступ вручную!",
-            parse_mode="HTML"
-        )
+    # Предотвращаем параллельные проверки одного и того же платежа
+    if user_id in CHECKING_PAYMENTS:
+        await callback.answer("⏳ Уже проверяю поступление, пожалуйста подождите...", show_alert=False)
         return
 
+    CHECKING_PAYMENTS.add(user_id)
+    await callback.answer("Проверяю поступления на Банку...", show_alert=False)
+
     try:
+        # Проверяем, не была ли оплата уже зачислена ранее
+        recent_cutoff = (datetime.now() - timedelta(minutes=60)).isoformat()
+        already_paid = query_db(
+            "SELECT * FROM processed_transactions WHERE user_id = ? AND created_at >= ?",
+            (user_id, recent_cutoff)
+        )
+        u_curr = get_user_data(user_id)
+        if already_paid and (u_curr.get("is_lifetime") or (u_curr.get("premium_until") and u_curr.get("premium_until") >= str(date.today())) or u_curr.get("extra_checks", 0) > 0):
+            success_already_text = (
+                f"✅ <b>Оплата уже была успешно зачислена!</b>\n\n"
+                f"Тариф <b>{html.escape(plan['title'])}</b> активен на вашем аккаунте.\n"
+                f"📊 Ваш баланс: <b>{html.escape(u_curr['status_text'])}</b>"
+            )
+            success_kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔍 Проверить вещь / обувь", callback_data="start_check")],
+                [InlineKeyboardButton(text="◀️ В главное меню", callback_data="back_to_main")]
+            ])
+            try:
+                await callback.message.edit_text(success_already_text, parse_mode="HTML", reply_markup=success_kb)
+            except Exception:
+                await callback.message.answer(success_already_text, parse_mode="HTML", reply_markup=success_kb)
+            return
+
+        if not MONOBANK_TOKEN:
+            await callback.message.answer(
+                "⚠️ Авто-проверка через API не подключена.\n\n"
+                "Нажмите кнопку <b>«📩 Я оплатил (Отправить чек админу)»</b>, чтобы администратор активировал доступ вручную!",
+                parse_mode="HTML"
+            )
+            return
+
         headers = {"X-Token": MONOBANK_TOKEN}
         now_ts = int(datetime.now().timestamp())
         from_ts = now_ts - 7200
 
         async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get("https://api.monobank.ua/personal/client-info", headers=headers)
-            if resp.status_code == 429:
-                await callback.message.answer(
-                    "⏳ Monobank разрешает опрашивать выписку не чаще 1 раза в минуту.\nПожалуйста, подождите 60 секунд.",
-                    parse_mode="HTML"
-                )
-                return
-
-            if resp.status_code != 200:
-                await callback.message.answer("⚠️ Банк временно не отвечает. Нажмите «📩 Я оплатил».")
-                return
-
-            client_info = resp.json()
-            jars = client_info.get("jars", [])
-            jar_account = jars[0].get("id") if jars else None
-
+            jar_account = CACHED_JAR_ACCOUNT
             if not jar_account:
-                accounts = client_info.get("accounts", [])
-                jar_account = accounts[0].get("id") if accounts else None
+                resp = await client.get("https://api.monobank.ua/personal/client-info", headers=headers)
+                if resp.status_code == 429:
+                    await callback.message.answer(
+                        "⏳ Monobank разрешает опрашивать выписку не чаще 1 раза в минуту.\nПожалуйста, подождите 60 секунд.",
+                        parse_mode="HTML"
+                    )
+                    return
 
-            if not jar_account:
-                await callback.message.answer("⚠️ Не удалось определить счет Банки. Нажмите «📩 Я оплатил».")
-                return
+                if resp.status_code != 200:
+                    await callback.message.answer("⚠️ Банк временно не отвечает. Нажмите «📩 Я оплатил».")
+                    return
+
+                client_info = resp.json()
+                jars = client_info.get("jars", [])
+                jar_account = jars[0].get("id") if jars else None
+
+                if not jar_account:
+                    accounts = client_info.get("accounts", [])
+                    jar_account = accounts[0].get("id") if accounts else None
+
+                if not jar_account:
+                    await callback.message.answer("⚠️ Не удалось определить счет Банки. Нажмите «📩 Я оплатил».")
+                    return
+
+                CACHED_JAR_ACCOUNT = jar_account
 
             stmt_url = f"https://api.monobank.ua/personal/statement/{jar_account}/{from_ts}/{now_ts}"
             stmt_resp = await client.get(stmt_url, headers=headers)
+
+            if stmt_resp.status_code == 429:
+                await callback.message.answer(
+                    "⏳ Лимит обращений к выписке Monobank (не чаще 1 раза в минуту).\nПожалуйста, подождите 60 секунд.",
+                    parse_mode="HTML"
+                )
+                return
 
             if stmt_resp.status_code == 200:
                 transactions = stmt_resp.json()
@@ -1363,13 +1408,36 @@ async def cb_check_monobank_statement(callback: CallbackQuery):
                 if found_tx:
                     activate_plan(user_id, plan_key, "monobank_auto", plan["uah"], "UAH")
                     u = get_user_data(user_id)
-                    await callback.message.answer(
+
+                    success_text = (
                         f"🎉 <b>Оплата найдена и подтверждена!</b>\n\n"
                         f"Тариф <b>{html.escape(plan['title'])}</b> активирован.\n"
-                        f"📊 Ваш новый баланс: <b>{html.escape(u['status_text'])}</b>",
-                        parse_mode="HTML",
-                        reply_markup=get_main_menu_keyboard()
+                        f"📊 Ваш новый баланс: <b>{html.escape(u['status_text'])}</b>"
                     )
+                    success_kb = InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="🔍 Проверить вещь / обувь", callback_data="start_check")],
+                        [InlineKeyboardButton(text="◀️ В главное меню", callback_data="back_to_main")]
+                    ])
+
+                    # Заменяем старое сообщение с кнопками оплаты, исключая повторные нажатия
+                    try:
+                        await callback.message.edit_text(success_text, parse_mode="HTML", reply_markup=success_kb)
+                    except Exception:
+                        await callback.message.answer(success_text, parse_mode="HTML", reply_markup=success_kb)
+
+                    if bot:
+                        username_str = f"@{callback.from_user.username}" if callback.from_user.username else f"ID: {user_id}"
+                        asyncio.create_task(
+                            bot.send_message(
+                                ADMIN_USER_ID,
+                                f"💳 <b>Поступление оплаты через Монобанку (Авто)!</b>\n\n"
+                                f"👤 Пользователь: {html.escape(username_str)} (<code>{user_id}</code>)\n"
+                                f"📦 Тариф: <b>{html.escape(plan['title'])}</b>\n"
+                                f"💵 Сумма: <b>{plan['uah']} грн</b>\n"
+                                f"🔑 ID транзакции: <code>{html.escape(str(found_tx.get('id', '')))}</code>",
+                                parse_mode="HTML"
+                            )
+                        )
                     return
 
             await callback.message.answer(
@@ -1380,6 +1448,8 @@ async def cb_check_monobank_statement(callback: CallbackQuery):
     except Exception as e:
         logger.error(f"Ошибка проверки Монобанка: {e}")
         await callback.message.answer("⚠️ Ошибка соединения с Monobank. Нажмите кнопку «📩 Я оплатил».")
+    finally:
+        CHECKING_PAYMENTS.discard(user_id)
 
 @dp.callback_query(F.data.startswith("notify_admin_mono:"))
 async def cb_notify_admin_mono(callback: CallbackQuery):
