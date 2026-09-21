@@ -642,6 +642,11 @@ class ClothingCheckFSM(StatesGroup):
     waiting_for_neck_tag = State()
     waiting_for_care_tag = State()
 
+class PhotoCardFSM(StatesGroup):
+    waiting_for_photo_1 = State()
+    waiting_for_photo_2 = State()
+    waiting_for_photo_3 = State()
+
 class PromoInputFSM(StatesGroup):
     waiting_for_promo_code = State()
 
@@ -1117,7 +1122,8 @@ dp = Dispatcher(storage=MemoryStorage())
 
 def get_main_menu_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔍 Проверить вещь / обувь (3 фото)", callback_data="start_check")],
+        [InlineKeyboardButton(text="🔍 Проверить вещь (Легит-чек)", callback_data="start_check")],
+        [InlineKeyboardButton(text="📸 Создать фотокарточку (3 любых фото)", callback_data="start_photocard")],
         [InlineKeyboardButton(text="🎁 Бесплатные проверки (+2 за друга)", callback_data="show_referral")],
         [
             InlineKeyboardButton(text="💎 Тарифы и Безлимит", callback_data="show_plans"),
@@ -1200,11 +1206,10 @@ async def cmd_start(message: Message, state: FSMContext):
     welcome_text = (
         f"👋 Привет, <b>{name}</b>!\n\n"
         "Я — <b>Resale & Legit Checker Bot</b>.\n"
-        "Универсальный помощник для оценки любой одежды и обуви:\n"
-        "• Распознаю любой бренд, точную модель и артикул\n"
-        "• Проведу экспертный легит-чек по биркам, штрихкодам и фурнитуре\n"
-        "• Покажу реальную стоимость на вторичке (Шафа, OLX) и проданные пары на eBay\n"
-        "• Сгенерирую готовую карточку для быстрой продажи в 1 клик\n\n"
+        "Универсальный помощник для оценки и продажи любой одежды и обуви:\n"
+        "• <b>Легит-чек</b> — экспертная проверка на оригинальность по биркам и фурнитуре\n"
+        "• <b>Студийные фотокарточки</b> — вырезание фона на 3 любых фото + готовый текст продажи\n"
+        "• <b>Оценка стоимости</b> — реальные цены вторички (Шафа, OLX) и проданные пары на eBay\n\n"
         f"📊 Твой статус: <b>{html.escape(u['status_text'])}</b>."
     )
     await message.answer(welcome_text, parse_mode="HTML", reply_markup=get_main_menu_keyboard())
@@ -2818,7 +2823,7 @@ async def process_care_tag_photo(message: Message, state: FSMContext):
 
         keyboard_buttons = [
             [
-                InlineKeyboardButton(text="📸 Створити картку для продажу (3 фото + опис)", callback_data=f"show_card:{message.from_user.id}")
+                InlineKeyboardButton(text="📋 Текстова картка для продажу", callback_data=f"show_card:{message.from_user.id}")
             ],
             [
                 InlineKeyboardButton(text="🇺🇦 Шафа (Shafa.ua)", url=links["shafa_ua"]),
@@ -2868,10 +2873,9 @@ async def process_care_tag_photo(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("show_card:"))
 async def cb_show_sales_card(callback: CallbackQuery):
-    await callback.answer("⏳ Готую студійні фото та картку...", show_alert=False)
+    await callback.answer()
     target_user_id = int(callback.data.split(":")[1])
 
-    # 1. Получаем данные проверки и карточки
     check_data = USER_CHECK_DATA.get(target_user_id) or USER_CHECK_DATA.get(callback.from_user.id)
     req_username = callback.from_user.username
 
@@ -2882,54 +2886,11 @@ async def cb_show_sales_card(callback: CallbackQuery):
 
     if not card_text:
         await callback.message.answer(
-            "⚠️ Дані перевірки не знайдені або застаріли. Запустіть перевірку речі заново через кнопку «🔍 Проверить вещь».",
+            "⚠️ Дані перевірки не знайдені або застаріли. Запустіть перевірку речі заново через меню.",
             parse_mode="HTML"
         )
         return
 
-    photos = USER_CHECK_PHOTOS.get(target_user_id) or USER_CHECK_PHOTOS.get(callback.from_user.id)
-
-    # 2. Если фото есть в памяти, генерируем студийные 1080x1080 фото на белом фоне с тенью
-    if photos and len(photos) == 3 and bot:
-        progress_msg = await callback.message.answer(
-            "🎨 <b>Створюю студійні фото товару на білому фоні з тінню...</b>\n"
-            "Обробляю 3 фотографії (загальний план, головна бирка, wash tag).",
-            parse_mode="HTML"
-        )
-        try:
-            studio_images = await asyncio.to_thread(
-                process_all_studio_photos_sync, photos, REMOVE_BG_API_KEY
-            )
-
-            caption_for_album = f"📋 <b>Картка товару:</b>\n\n<code>{html.escape(card_text)}</code>" if len(card_text) < 950 else None
-
-            media_group = [
-                InputMediaPhoto(
-                    media=BufferedInputFile(studio_images[0], filename="studio_item_1.jpg"),
-                    caption=caption_for_album,
-                    parse_mode="HTML"
-                ),
-                InputMediaPhoto(
-                    media=BufferedInputFile(studio_images[1], filename="studio_item_2.jpg")
-                ),
-                InputMediaPhoto(
-                    media=BufferedInputFile(studio_images[2], filename="studio_item_3.jpg")
-                )
-            ]
-
-            await bot.send_media_group(chat_id=callback.message.chat.id, media=media_group)
-            try:
-                await progress_msg.delete()
-            except Exception:
-                pass
-        except Exception as proc_err:
-            logger.error(f"Помилка відправки студійних фото: {proc_err}")
-            try:
-                await progress_msg.delete()
-            except Exception:
-                pass
-
-    # 3. Отправляем сообщение для быстрого копирования текста в 1 клік
     reply_text = (
         "📋 <b>Готова картка для продажу</b>\n"
         "<i>(Натисніть на текст нижче в сірому полі, щоб скопіювати його в 1 клік):</i>\n\n"
@@ -2941,6 +2902,182 @@ async def cb_show_sales_card(callback: CallbackQuery):
     ])
 
     await callback.message.answer(reply_text, parse_mode="HTML", reply_markup=close_kb)
+
+@dp.callback_query(F.data == "start_photocard")
+async def cb_start_photocard(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    user_id = callback.from_user.id
+
+    can_proceed, reason = await check_can_proceed(user_id)
+    if not can_proceed:
+        if reason == "need_sub":
+            text = (
+                "🔒 <b>Обязательная подписка на канал!</b>\n\n"
+                "Для использования бота необходимо подписаться на наш Telegram-канал:\n"
+                f"👉 <a href=\"{CHANNEL_URL}\"><b>{CHANNEL_USERNAME}</b></a>\n\n"
+                "После подписки нажмите <b>«✅ Проверить подписку»</b> 👇"
+            )
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📢 Подписаться на канал", url=CHANNEL_URL)],
+                [InlineKeyboardButton(text="✅ Проверить подписку", callback_data="check_channel_sub")]
+            ])
+            await callback.message.answer(text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
+            return
+
+        text = (
+            "⚠️ <b>У вас закончились проверки!</b>\n\n"
+            "Вы использовали все стартовые бесплатные проверки.\n\n"
+            "🎁 <b>Как получить проверки:</b>\n"
+            "• Пригласите друга по своей реферальной ссылке и получите <b>+2 проверки бесплатно</b>\n"
+            "• Либо выберите пакет проверок / безлимит в тарифах 👇"
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🎁 Пригласить друга (+2 проверки)", callback_data="show_referral")],
+            [InlineKeyboardButton(text="💎 Снять лимит (Тарифы)", callback_data="show_plans")],
+            [InlineKeyboardButton(text="◀️ В меню", callback_data="back_to_main")]
+        ])
+        await callback.message.answer(text, parse_mode="HTML", reply_markup=kb)
+        return
+
+    await state.set_state(PhotoCardFSM.waiting_for_photo_1)
+    cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ Отмена", callback_data="back_to_main")]
+    ])
+    await callback.message.answer(
+        "📸 <b>Создание студийной фотокарточки (Шаг 1 из 3)</b>\n\n"
+        "Отправьте <b>первое фото вещи</b> (любой ракурс, какой вы хотите для продажи — например, общий вид спереди).\n\n"
+        "<i>Бот вырежет фон на всех 3 фото, оформит их в студийном формате 1080x1080 с тенью и сгенерирует описание.</i>",
+        parse_mode="HTML",
+        reply_markup=cancel_kb
+    )
+
+@dp.message(StateFilter(PhotoCardFSM.waiting_for_photo_1), F.photo)
+async def process_photocard_photo_1(message: Message, state: FSMContext):
+    if bot:
+        p1_bytes = await fetch_and_prep_bytes(bot, message.photo[-1].file_id)
+        await state.update_data(pc_photo_1=p1_bytes)
+
+    await state.set_state(PhotoCardFSM.waiting_for_photo_2)
+    cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ Отмена", callback_data="back_to_main")]
+    ])
+    await message.answer(
+        "📸 <b>Шаг 2 из 3: Второе фото</b>\n\n"
+        "Отправьте <b>второе фото вещи</b> (любой ракурс — сзади, деталь, патч, вышивка или на человеке):",
+        parse_mode="HTML",
+        reply_markup=cancel_kb
+    )
+
+@dp.message(StateFilter(PhotoCardFSM.waiting_for_photo_2), F.photo)
+async def process_photocard_photo_2(message: Message, state: FSMContext):
+    if bot:
+        p2_bytes = await fetch_and_prep_bytes(bot, message.photo[-1].file_id)
+        await state.update_data(pc_photo_2=p2_bytes)
+
+    await state.set_state(PhotoCardFSM.waiting_for_photo_3)
+    cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ Отмена", callback_data="back_to_main")]
+    ])
+    await message.answer(
+        "📸 <b>Шаг 3 из 3: Третье фото</b>\n\n"
+        "Отправьте <b>третье фото вещи</b> (бирка, подошва, фурнитура или любой дополнительный план):",
+        parse_mode="HTML",
+        reply_markup=cancel_kb
+    )
+
+@dp.message(StateFilter(PhotoCardFSM.waiting_for_photo_3), F.photo)
+async def process_photocard_photo_3(message: Message, state: FSMContext):
+    user_data = await state.get_data()
+    await state.clear()
+
+    status_msg = await message.answer(
+        "🎨 <b>Створюю студійні фото товару на білому фоні з тінню...</b>\n"
+        "Обробляю 3 фотографії, вирізаю фон та формую картку для продажу.",
+        parse_mode="HTML"
+    )
+
+    try:
+        if not bot:
+            raise RuntimeError("Telegram Bot instance not ready")
+
+        p3_bytes = await fetch_and_prep_bytes(bot, message.photo[-1].file_id)
+        p1_bytes = user_data.get("pc_photo_1")
+        p2_bytes = user_data.get("pc_photo_2")
+
+        if not p1_bytes or not p2_bytes:
+            raise ValueError("Не вдалося завантажити попередні фото. Будь ласка, почніть створення картки заново.")
+
+        # Списываем 1 проверку за генерацию студийной фотокарточки
+        await decrement_check(message.from_user.id)
+
+        # Запускаем параллельно обработку 3 фото и определение параметров через AI
+        photos = [p1_bytes, p2_bytes, p3_bytes]
+        studio_images_task = asyncio.to_thread(process_all_studio_photos_sync, photos, REMOVE_BG_API_KEY)
+
+        image_parts = [
+            genai_types.Part.from_bytes(data=p1_bytes, mime_type="image/jpeg"),
+            genai_types.Part.from_bytes(data=p2_bytes, mime_type="image/jpeg"),
+            genai_types.Part.from_bytes(data=p3_bytes, mime_type="image/jpeg")
+        ]
+
+        try:
+            detected_data = await analyze_with_gemini_fallback(image_parts)
+        except Exception as ai_err:
+            logger.warning(f"Сбой распознавания AI при создании фотокарточки: {ai_err}")
+            detected_data = {
+                "brand": "Бренд",
+                "item_name": "Річ",
+                "authenticity_verdict": "Оригінал",
+                "authenticity_score": 90,
+                "item_condition": "Відмінний (без дефектів)",
+                "size": "Уточнюйте",
+                "price_uah_max": 800
+            }
+
+        studio_images = await studio_images_task
+        card_text = build_sales_card_text(detected_data, message.from_user.username)
+
+        # Отправляем 3 студийные фотографии альбомом
+        caption_for_album = f"📋 <b>Картка товару:</b>\n\n<code>{html.escape(card_text)}</code>" if len(card_text) < 950 else None
+        media_group = [
+            InputMediaPhoto(
+                media=BufferedInputFile(studio_images[0], filename="studio_1.jpg"),
+                caption=caption_for_album,
+                parse_mode="HTML"
+            ),
+            InputMediaPhoto(
+                media=BufferedInputFile(studio_images[1], filename="studio_2.jpg")
+            ),
+            InputMediaPhoto(
+                media=BufferedInputFile(studio_images[2], filename="studio_3.jpg")
+            )
+        ]
+
+        await bot.send_media_group(chat_id=message.chat.id, media=media_group)
+
+        # Отправляем блок для мгновенного копирования текста
+        reply_text = (
+            "📋 <b>Готова картка для продажу</b>\n"
+            "<i>(Натисніть на текст нижче в сірому полі, щоб скопіювати його в 1 клік):</i>\n\n"
+            f"<code>{html.escape(card_text)}</code>"
+        )
+        close_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📸 Створити ще картку", callback_data="start_photocard")],
+            [InlineKeyboardButton(text="◀️ В головне меню", callback_data="back_to_main")]
+        ])
+        await message.answer(reply_text, parse_mode="HTML", reply_markup=close_kb)
+
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+
+    except Exception as exc:
+        logger.error(f"Помилка створення фотокартки: {exc}", exc_info=True)
+        try:
+            await status_msg.edit_text(f"❌ Не вдалося створити фотокартку: {html.escape(str(exc)[:100])}", parse_mode="HTML")
+        except Exception:
+            pass
 
 @dp.callback_query(F.data == "close_sales_card")
 async def cb_close_sales_card(callback: CallbackQuery):
