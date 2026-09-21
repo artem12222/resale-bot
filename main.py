@@ -25,9 +25,11 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
+    BufferedInputFile,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaPhoto,
     LabeledPrice,
     Message,
     PreCheckoutQuery,
@@ -35,7 +37,7 @@ from aiogram.types import (
 from google import genai
 from google.genai import types as genai_types
 import httpx
-from PIL import Image, ImageOps
+from PIL import Image, ImageDraw, ImageFilter, ImageOps
 
 logging.basicConfig(
     level=logging.INFO,
@@ -46,6 +48,7 @@ logger = logging.getLogger(__name__)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "5641374843"))
+REMOVE_BG_API_KEY = os.getenv("REMOVE_BG_API_KEY", "").strip()
 
 RAW_JAR_URL = os.getenv("MONOBANK_JAR_URL", "https://send.monobank.ua/jar/7E9CVK1jX1").strip().strip('"').strip("'")
 if not RAW_JAR_URL.startswith("http"):
@@ -655,6 +658,7 @@ class BroadcastFSM(StatesGroup):
 
 USER_SALES_CARDS: dict[int, str] = {}
 USER_CHECK_DATA: dict[int, dict] = {}
+USER_CHECK_PHOTOS: dict[int, list[bytes]] = {}
 
 def build_sales_card_text(data: dict, username: Optional[str] = None) -> str:
     """Формирует карточку продажи строго по заданному формату на украинском языке."""
@@ -694,6 +698,156 @@ def build_sales_card_text(data: dict, username: Optional[str] = None) -> str:
         lines.append(f"Замовити: @{clean_user}")
 
     return "\n".join(lines)
+
+def create_studio_photo_sync(image_bytes: bytes, api_key: str = "") -> bytes:
+    """Трансформирует фотографию вещи в студийный формат 1080x1080 на чистом белом фоне с тенью."""
+    # 1. Попытка использовать внешний remove.bg API, если передан ключ в переменных окружения
+    if api_key:
+        try:
+            with httpx.Client(timeout=12.0) as client:
+                resp = client.post(
+                    "https://api.remove.bg/v1.0/removebg",
+                    headers={"X-Api-Key": api_key},
+                    files={"image_file": image_bytes},
+                    data={"size": "auto", "format": "png"}
+                )
+                if resp.status_code == 200:
+                    with Image.open(io.BytesIO(resp.content)) as cutout_raw:
+                        return compose_studio_canvas(cutout_raw.convert("RGBA"), has_transparency=True)
+        except Exception as api_err:
+            logger.warning(f"Внешний Remove.bg API недоступен ({api_err}), переключаемся на локальный Pillow-движок.")
+
+    # 2. Локальный интеллектуальный движок студийной обработки в Pillow (без внешних зависимостей)
+    with Image.open(io.BytesIO(image_bytes)) as raw_img:
+        img = ImageOps.exif_transpose(raw_img)
+        img = img.convert("RGBA")
+        return process_local_cutout_and_shadow(img)
+
+def process_local_cutout_and_shadow(img: Image.Image) -> bytes:
+    """Выполняет сегментацию фона по цветовому полю краев и накладывает реалистичную тень."""
+    max_side = 880
+    ratio = min(max_side / img.width, max_side / img.height)
+    new_w = max(50, int(img.width * ratio))
+    new_h = max(50, int(img.height * ratio))
+    resized = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+
+    # Проверяем, есть ли уже прозрачность
+    has_cutout = False
+    alpha_extrema = resized.getextrema()[3] if resized.mode == "RGBA" else (255, 255)
+    if alpha_extrema[0] < 250:
+        has_cutout = True
+
+    if not has_cutout:
+        w_r, h_r = resized.size
+        # Сэмплируем цвета по периметру фотографии
+        border_pts = []
+        step_x = max(1, w_r // 25)
+        step_y = max(1, h_r // 25)
+        for x in range(0, w_r, step_x):
+            border_pts.append(resized.getpixel((x, 0))[:3])
+            border_pts.append(resized.getpixel((x, h_r - 1))[:3])
+        for y in range(0, h_r, step_y):
+            border_pts.append(resized.getpixel((0, y))[:3])
+            border_pts.append(resized.getpixel((w_r - 1, y))[:3])
+
+        avg_r = sum(p[0] for p in border_pts) // len(border_pts)
+        avg_g = sum(p[1] for p in border_pts) // len(border_pts)
+        avg_b = sum(p[2] for p in border_pts) // len(border_pts)
+
+        # Проверяем дисперсию фона (однородный ли фон: пол, простыня, стол, стена)
+        variance = sum((p[0] - avg_r)**2 + (p[1] - avg_g)**2 + (p[2] - avg_b)**2 for p in border_pts) / len(border_pts)
+
+        if variance < 2200:
+            pix = resized.load()
+            mask_data = []
+            cx, cy = w_r / 2.0, h_r / 2.0
+            max_r = (cx**2 + cy**2) ** 0.5
+
+            for y in range(h_r):
+                for x in range(w_r):
+                    pr, pg, pb = pix[x, y][:3]
+                    c_dist = ((pr - avg_r)**2 + (pg - avg_g)**2 + (pb - avg_b)**2)**0.5
+                    center_bias = 1.0 - ((((x - cx)**2 + (y - cy)**2)**0.5) / max_r)
+                    thresh = 36 + (center_bias * 24)
+
+                    if c_dist < thresh:
+                        mask_data.append(0)
+                    elif c_dist < thresh + 28:
+                        val = int(((c_dist - thresh) / 28.0) * 255)
+                        mask_data.append(val)
+                    else:
+                        mask_data.append(255)
+
+            alpha_mask = Image.new("L", (w_r, h_r))
+            alpha_mask.putdata(mask_data)
+            alpha_mask = alpha_mask.filter(ImageFilter.GaussianBlur(radius=1.8))
+
+            visible_count = sum(1 for a in mask_data if a > 120)
+            coverage = visible_count / (w_r * h_r)
+            if 0.12 < coverage < 0.92:
+                resized.putalpha(alpha_mask)
+                has_cutout = True
+
+    return compose_studio_canvas(resized, has_transparency=has_cutout)
+
+def compose_studio_canvas(obj: Image.Image, has_transparency: bool) -> bytes:
+    """Размещает объект на белом холсте 1080x1080 с мягкой естественной тенью."""
+    canvas_size = 1080
+    canvas = Image.new("RGBA", (canvas_size, canvas_size), (255, 255, 255, 255))
+
+    pos_x = (canvas_size - obj.width) // 2
+    pos_y = (canvas_size - obj.height) // 2 - 18
+
+    if has_transparency:
+        # Естественная тень по контуру силуэта вещи
+        alpha = obj.split()[3]
+        shadow_mask = Image.new("L", (canvas_size, canvas_size), 0)
+        shadow_mask.paste(alpha, (pos_x, pos_y + 36))
+        blurred = shadow_mask.filter(ImageFilter.GaussianBlur(radius=28))
+
+        shadow_layer = Image.new("RGBA", (canvas_size, canvas_size), (30, 30, 35, 0))
+        shadow_layer.putalpha(blurred.point(lambda p: int(p * 0.35)))
+
+        canvas.alpha_composite(shadow_layer)
+        canvas.paste(obj, (pos_x, pos_y), obj)
+    else:
+        # Элегантная галерейная плашка со скруглением и глубокой многослойной тенью
+        radius = 28
+        mask = Image.new("L", (obj.width, obj.height), 0)
+        draw_m = ImageDraw.Draw(mask)
+        draw_m.rounded_rectangle([(0, 0), (obj.width, obj.height)], radius=radius, fill=255)
+
+        shadow_mask = Image.new("L", (canvas_size, canvas_size), 0)
+        shadow_mask.paste(mask, (pos_x, pos_y + 26))
+        blurred = shadow_mask.filter(ImageFilter.GaussianBlur(radius=30))
+
+        shadow_layer = Image.new("RGBA", (canvas_size, canvas_size), (25, 25, 30, 0))
+        shadow_layer.putalpha(blurred.point(lambda p: int(p * 0.30)))
+
+        canvas.alpha_composite(shadow_layer)
+        canvas.paste(obj, (pos_x, pos_y), mask)
+
+        # Тонкая премиальная рамка
+        border = Image.new("RGBA", (obj.width, obj.height), (0, 0, 0, 0))
+        draw_b = ImageDraw.Draw(border)
+        draw_b.rounded_rectangle([(0, 0), (obj.width - 1, obj.height - 1)], radius=radius, outline=(225, 228, 235, 200), width=2)
+        canvas.paste(border, (pos_x, pos_y), border)
+
+    final_rgb = canvas.convert("RGB")
+    buf = io.BytesIO()
+    final_rgb.save(buf, format="JPEG", quality=88, optimize=True)
+    return buf.getvalue()
+
+def process_all_studio_photos_sync(photos_bytes: list[bytes], api_key: str = "") -> list[bytes]:
+    """Последовательно генерирует 3 студийные фотографии на чистом белом фоне."""
+    results = []
+    for raw in photos_bytes:
+        try:
+            results.append(create_studio_photo_sync(raw, api_key))
+        except Exception as e:
+            logger.error(f"Сбой студийной обработки фото: {e}")
+            results.append(raw)
+    return results
 
 ANALYSIS_PROMPT = """
 Ты — ведущий мировой эксперт-криминалист по легит-чеку, ресейлу и аутентификации брендовой одежды, обуви (кроссовок) и аксессуаров.
@@ -2645,8 +2799,9 @@ async def process_care_tag_photo(message: Message, state: FSMContext):
         price_usd_min = safe_int(data.get("price_usd_min"), 10)
         price_usd_max = safe_int(data.get("price_usd_max"), 20)
 
-        # Сохраняем сырые данные и сформированную карточку с юзернеймом автора
+        # Сохраняем сырые данные, фото и сформированную карточку с юзернеймом автора
         USER_CHECK_DATA[message.from_user.id] = data
+        USER_CHECK_PHOTOS[message.from_user.id] = [p1_bytes, p2_bytes, p3_bytes]
         USER_SALES_CARDS[message.from_user.id] = build_sales_card_text(data, message.from_user.username)
 
         result_message = (
@@ -2663,7 +2818,7 @@ async def process_care_tag_photo(message: Message, state: FSMContext):
 
         keyboard_buttons = [
             [
-                InlineKeyboardButton(text="📋 Карточка для продажи (Текст)", callback_data=f"show_card:{message.from_user.id}")
+                InlineKeyboardButton(text="📸 Створити картку для продажу (3 фото + опис)", callback_data=f"show_card:{message.from_user.id}")
             ],
             [
                 InlineKeyboardButton(text="🇺🇦 Шафа (Shafa.ua)", url=links["shafa_ua"]),
@@ -2713,15 +2868,13 @@ async def process_care_tag_photo(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("show_card:"))
 async def cb_show_sales_card(callback: CallbackQuery):
-    await callback.answer()
+    await callback.answer("⏳ Готую студійні фото та картку...", show_alert=False)
     target_user_id = int(callback.data.split(":")[1])
-    
-    # Берем данные проверки
+
+    # 1. Получаем данные проверки и карточки
     check_data = USER_CHECK_DATA.get(target_user_id) or USER_CHECK_DATA.get(callback.from_user.id)
-    
-    # Юзернейм берем у того, кто запросил карточку прямо сейчас (или из профиля)
     req_username = callback.from_user.username
-    
+
     if check_data:
         card_text = build_sales_card_text(check_data, req_username)
     else:
@@ -2729,11 +2882,54 @@ async def cb_show_sales_card(callback: CallbackQuery):
 
     if not card_text:
         await callback.message.answer(
-            "⚠️ Карточка не найдена или устарела. Запустите проверку вещи заново через кнопку «🔍 Проверить вещь».",
+            "⚠️ Дані перевірки не знайдені або застаріли. Запустіть перевірку речі заново через кнопку «🔍 Проверить вещь».",
             parse_mode="HTML"
         )
         return
 
+    photos = USER_CHECK_PHOTOS.get(target_user_id) or USER_CHECK_PHOTOS.get(callback.from_user.id)
+
+    # 2. Если фото есть в памяти, генерируем студийные 1080x1080 фото на белом фоне с тенью
+    if photos and len(photos) == 3 and bot:
+        progress_msg = await callback.message.answer(
+            "🎨 <b>Створюю студійні фото товару на білому фоні з тінню...</b>\n"
+            "Обробляю 3 фотографії (загальний план, головна бирка, wash tag).",
+            parse_mode="HTML"
+        )
+        try:
+            studio_images = await asyncio.to_thread(
+                process_all_studio_photos_sync, photos, REMOVE_BG_API_KEY
+            )
+
+            caption_for_album = f"📋 <b>Картка товару:</b>\n\n<code>{html.escape(card_text)}</code>" if len(card_text) < 950 else None
+
+            media_group = [
+                InputMediaPhoto(
+                    media=BufferedInputFile(studio_images[0], filename="studio_item_1.jpg"),
+                    caption=caption_for_album,
+                    parse_mode="HTML"
+                ),
+                InputMediaPhoto(
+                    media=BufferedInputFile(studio_images[1], filename="studio_item_2.jpg")
+                ),
+                InputMediaPhoto(
+                    media=BufferedInputFile(studio_images[2], filename="studio_item_3.jpg")
+                )
+            ]
+
+            await bot.send_media_group(chat_id=callback.message.chat.id, media=media_group)
+            try:
+                await progress_msg.delete()
+            except Exception:
+                pass
+        except Exception as proc_err:
+            logger.error(f"Помилка відправки студійних фото: {proc_err}")
+            try:
+                await progress_msg.delete()
+            except Exception:
+                pass
+
+    # 3. Отправляем сообщение для быстрого копирования текста в 1 клік
     reply_text = (
         "📋 <b>Готова картка для продажу</b>\n"
         "<i>(Натисніть на текст нижче в сірому полі, щоб скопіювати його в 1 клік):</i>\n\n"
