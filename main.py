@@ -208,7 +208,7 @@ if TURSO_DB_URL and TURSO_DB_TOKEN:
         turso_client = None
 
 def query_db(sql: str, params: tuple = ()) -> list[dict]:
-    """Выполняет SQL-запрос в Turso Cloud. При сетевом сбое мягко переключается на локальный SQLite."""
+    """Выполняет SQL-запрос в Turso Cloud с плавным локальным fallback на SQLite."""
     if turso_client:
         try:
             return turso_client.execute(sql, params)
@@ -250,6 +250,8 @@ def init_db():
             query_db("ALTER TABLE users ADD COLUMN initial_checks_used INTEGER DEFAULT 0")
         if "sub_prompt_shown" not in existing_col_names:
             query_db("ALTER TABLE users ADD COLUMN sub_prompt_shown INTEGER DEFAULT 0")
+        if "referred_by_user" not in existing_col_names:
+            query_db("ALTER TABLE users ADD COLUMN referred_by_user INTEGER DEFAULT NULL")
     except Exception as e:
         logger.debug(f"Проверка колонок users: {e}")
 
@@ -353,16 +355,6 @@ def init_db():
         )
     """)
 
-    try:
-        user_cols = query_db("PRAGMA table_info(users)")
-        existing_col_names = [c.get("name") for c in user_cols if isinstance(c, dict)]
-        if "referred_by_blogger" not in existing_col_names:
-            query_db("ALTER TABLE users ADD COLUMN referred_by_blogger TEXT DEFAULT NULL")
-        if "referred_by_user" not in existing_col_names:
-            query_db("ALTER TABLE users ADD COLUMN referred_by_user INTEGER DEFAULT NULL")
-    except Exception as e:
-        logger.debug(f"Проверка колонки referred_by_blogger: {e}")
-
     logger.info("База данных инициализирована (Turso Cloud / SQLite)")
 
 async def check_channel_subscription(user_id: int) -> bool:
@@ -405,7 +397,6 @@ def get_user_data(user_id: int, username: Optional[str] = None, is_subscribed: b
     is_lifetime = int(row.get("is_lifetime") or 0)
     initial_checks_used = int(row.get("initial_checks_used") or 0)
 
-    # Стартовые проверки не сбрасываются каждый день (разовые 3 шт на аккаунт)
     rem_starter = max(0, FREE_CHECKS_PER_DAY - initial_checks_used)
     total_available = rem_starter + extra_checks
 
@@ -456,7 +447,6 @@ async def decrement_check(user_id: int):
     u = get_user_data(user_id, is_subscribed=is_sub)
     today_str = datetime.now(KYIV_TZ).strftime("%Y-%m-%d")
 
-    # Фиксируем обращение пользователя в журнале активности за сегодня
     query_db(
         "INSERT INTO usage_logs (user_id, action_date) VALUES (?, ?)",
         (user_id, today_str)
@@ -475,7 +465,6 @@ async def decrement_check(user_id: int):
             (today_str, user_id)
         )
 
-    # Проверяем реферальное вознаграждение (+2 проверки пригласившему за ПЕРВУЮ проверку друга)
     ref_rows = query_db(
         "SELECT id, referrer_id FROM user_referrals WHERE referred_user_id = ? AND reward_given = 0",
         (user_id,)
@@ -551,8 +540,7 @@ def activate_plan(user_id: int, plan_id: str, method: str, amount: float, curren
                 fine_pct = float(b.get("fine_percent") or 0.0)
                 fine_until = b.get("fine_until")
 
-                # Применяем штраф, если срок его действия (1 месяц) ещё не истёк
-                if fine_until and fine_until >= today_str:
+                if fine_until and fine_until >= today_str and fine_pct > 0:
                     effective_rate = max(0.0, base_rate - fine_pct)
                     rate_desc = f"{effective_rate:.1f}% (штраф -{fine_pct:.0f}% до {fine_until})"
                 else:
@@ -616,7 +604,6 @@ def get_candidate_models() -> list[str]:
         except Exception as e:
             logger.warning(f"Не удалось получить список моделей через API: {e}")
 
-    # Надежные модели на разных независимых кластерах GPU Google
     preferred = [
         "gemini-2.0-flash",
         "gemini-2.5-flash",
@@ -697,7 +684,6 @@ def build_sales_card_text(data: dict, username: Optional[str] = None) -> str:
         f"Ціна: {price} грн"
     ]
 
-    # Юзернейм берется у человека, который запросил карточку. Если нет — строки нет вообще
     if username and username.strip():
         clean_user = username.strip().lstrip("@")
         lines.append(f"Замовити: @{clean_user}")
@@ -705,11 +691,15 @@ def build_sales_card_text(data: dict, username: Optional[str] = None) -> str:
     return "\n".join(lines)
 
 def create_studio_photo_sync(image_bytes: bytes, api_key: str = "") -> bytes:
-    """Трансформирует фотографию вещи в студийный формат 1080x1080 на чистом белом фоне с тенью."""
-    # 1. Попытка использовать внешний remove.bg API, если передан ключ в переменных окружения
+    """Трансформирует фото в студийный формат БЕЗ отдаления: точный исходный масштаб кадра на белом фоне."""
+    with Image.open(io.BytesIO(image_bytes)) as raw_img:
+        orig_img = ImageOps.exif_transpose(raw_img).convert("RGB")
+        orig_w, orig_h = orig_img.size
+
+    # 1. Если подключен Remove.bg API — получаем маску и накладываем на оригинальное полноразмерное фото
     if api_key:
         try:
-            with httpx.Client(timeout=12.0) as client:
+            with httpx.Client(timeout=15.0) as client:
                 resp = client.post(
                     "https://api.remove.bg/v1.0/removebg",
                     headers={"X-Api-Key": api_key},
@@ -718,133 +708,94 @@ def create_studio_photo_sync(image_bytes: bytes, api_key: str = "") -> bytes:
                 )
                 if resp.status_code == 200:
                     with Image.open(io.BytesIO(resp.content)) as cutout_raw:
-                        return compose_studio_canvas(cutout_raw.convert("RGBA"), has_transparency=True)
+                        alpha = cutout_raw.split()[3]
+                        if alpha.size != (orig_w, orig_h):
+                            alpha = alpha.resize((orig_w, orig_h), Image.Resampling.LANCZOS)
+                        
+                        cutout_full = orig_img.convert("RGBA")
+                        cutout_full.putalpha(alpha)
+                        return render_exact_frame_studio(cutout_full, (orig_w, orig_h))
         except Exception as api_err:
-            logger.warning(f"Внешний Remove.bg API недоступен ({api_err}), переключаемся на локальный Pillow-движок.")
+            logger.warning(f"Внешний Remove.bg API недоступен ({api_err}), переключаемся на локальную обработку.")
 
-    # 2. Локальный интеллектуальный движок студийной обработки в Pillow (без внешних зависимостей)
-    with Image.open(io.BytesIO(image_bytes)) as raw_img:
-        img = ImageOps.exif_transpose(raw_img)
-        img = img.convert("RGBA")
-        return process_local_cutout_and_shadow(img)
+    # 2. Локальный движок (без изменения масштаба и без отдаления)
+    return process_local_cutout_and_shadow(orig_img)
 
-def process_local_cutout_and_shadow(img: Image.Image) -> bytes:
-    """Выполняет сегментацию фона по цветовому полю краев и накладывает реалистичную тень."""
-    max_side = 880
-    ratio = min(max_side / img.width, max_side / img.height)
-    new_w = max(50, int(img.width * ratio))
-    new_h = max(50, int(img.height * ratio))
-    resized = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+def render_exact_frame_studio(cutout_rgba: Image.Image, size: tuple[int, int]) -> bytes:
+    """Размещает вещь в ТОЧНОМ исходном положении и масштабе на белом фоне с естественной мягкой тенью."""
+    orig_w, orig_h = size
+    canvas = Image.new("RGBA", (orig_w, orig_h), (255, 255, 255, 255))
+    alpha = cutout_rgba.split()[3]
 
-    # Проверяем, есть ли уже прозрачность
-    has_cutout = False
-    alpha_extrema = resized.getextrema()[3] if resized.mode == "RGBA" else (255, 255)
-    if alpha_extrema[0] < 250:
-        has_cutout = True
+    shadow_mask = Image.new("L", (orig_w, orig_h), 0)
+    shadow_offset_y = max(4, int(orig_h * 0.012))
+    shadow_mask.paste(alpha, (0, shadow_offset_y))
 
-    if not has_cutout:
-        w_r, h_r = resized.size
-        # Сэмплируем цвета по периметру фотографии
-        border_pts = []
-        step_x = max(1, w_r // 25)
-        step_y = max(1, h_r // 25)
-        for x in range(0, w_r, step_x):
-            border_pts.append(resized.getpixel((x, 0))[:3])
-            border_pts.append(resized.getpixel((x, h_r - 1))[:3])
-        for y in range(0, h_r, step_y):
-            border_pts.append(resized.getpixel((0, y))[:3])
-            border_pts.append(resized.getpixel((w_r - 1, y))[:3])
+    blur_radius = max(6, int(min(orig_w, orig_h) * 0.018))
+    blurred_shadow = shadow_mask.filter(ImageFilter.GaussianBlur(radius=blur_radius))
 
-        avg_r = sum(p[0] for p in border_pts) // len(border_pts)
-        avg_g = sum(p[1] for p in border_pts) // len(border_pts)
-        avg_b = sum(p[2] for p in border_pts) // len(border_pts)
+    shadow_layer = Image.new("RGBA", (orig_w, orig_h), (25, 25, 30, 0))
+    shadow_layer.putalpha(blurred_shadow.point(lambda p: int(p * 0.28)))
 
-        # Проверяем дисперсию фона (однородный ли фон: пол, простыня, стол, стена)
-        variance = sum((p[0] - avg_r)**2 + (p[1] - avg_g)**2 + (p[2] - avg_b)**2 for p in border_pts) / len(border_pts)
-
-        if variance < 2200:
-            pix = resized.load()
-            mask_data = []
-            cx, cy = w_r / 2.0, h_r / 2.0
-            max_r = (cx**2 + cy**2) ** 0.5
-
-            for y in range(h_r):
-                for x in range(w_r):
-                    pr, pg, pb = pix[x, y][:3]
-                    c_dist = ((pr - avg_r)**2 + (pg - avg_g)**2 + (pb - avg_b)**2)**0.5
-                    center_bias = 1.0 - ((((x - cx)**2 + (y - cy)**2)**0.5) / max_r)
-                    thresh = 36 + (center_bias * 24)
-
-                    if c_dist < thresh:
-                        mask_data.append(0)
-                    elif c_dist < thresh + 28:
-                        val = int(((c_dist - thresh) / 28.0) * 255)
-                        mask_data.append(val)
-                    else:
-                        mask_data.append(255)
-
-            alpha_mask = Image.new("L", (w_r, h_r))
-            alpha_mask.putdata(mask_data)
-            alpha_mask = alpha_mask.filter(ImageFilter.GaussianBlur(radius=1.8))
-
-            visible_count = sum(1 for a in mask_data if a > 120)
-            coverage = visible_count / (w_r * h_r)
-            if 0.12 < coverage < 0.92:
-                resized.putalpha(alpha_mask)
-                has_cutout = True
-
-    return compose_studio_canvas(resized, has_transparency=has_cutout)
-
-def compose_studio_canvas(obj: Image.Image, has_transparency: bool) -> bytes:
-    """Размещает объект на белом холсте 1080x1080 с мягкой естественной тенью."""
-    canvas_size = 1080
-    canvas = Image.new("RGBA", (canvas_size, canvas_size), (255, 255, 255, 255))
-
-    pos_x = (canvas_size - obj.width) // 2
-    pos_y = (canvas_size - obj.height) // 2 - 18
-
-    if has_transparency:
-        # Естественная тень по контуру силуэта вещи
-        alpha = obj.split()[3]
-        shadow_mask = Image.new("L", (canvas_size, canvas_size), 0)
-        shadow_mask.paste(alpha, (pos_x, pos_y + 36))
-        blurred = shadow_mask.filter(ImageFilter.GaussianBlur(radius=28))
-
-        shadow_layer = Image.new("RGBA", (canvas_size, canvas_size), (30, 30, 35, 0))
-        shadow_layer.putalpha(blurred.point(lambda p: int(p * 0.35)))
-
-        canvas.alpha_composite(shadow_layer)
-        canvas.paste(obj, (pos_x, pos_y), obj)
-    else:
-        # Элегантная галерейная плашка со скруглением и глубокой многослойной тенью
-        radius = 28
-        mask = Image.new("L", (obj.width, obj.height), 0)
-        draw_m = ImageDraw.Draw(mask)
-        draw_m.rounded_rectangle([(0, 0), (obj.width, obj.height)], radius=radius, fill=255)
-
-        shadow_mask = Image.new("L", (canvas_size, canvas_size), 0)
-        shadow_mask.paste(mask, (pos_x, pos_y + 26))
-        blurred = shadow_mask.filter(ImageFilter.GaussianBlur(radius=30))
-
-        shadow_layer = Image.new("RGBA", (canvas_size, canvas_size), (25, 25, 30, 0))
-        shadow_layer.putalpha(blurred.point(lambda p: int(p * 0.30)))
-
-        canvas.alpha_composite(shadow_layer)
-        canvas.paste(obj, (pos_x, pos_y), mask)
-
-        # Тонкая премиальная рамка
-        border = Image.new("RGBA", (obj.width, obj.height), (0, 0, 0, 0))
-        draw_b = ImageDraw.Draw(border)
-        draw_b.rounded_rectangle([(0, 0), (obj.width - 1, obj.height - 1)], radius=radius, outline=(225, 228, 235, 200), width=2)
-        canvas.paste(border, (pos_x, pos_y), border)
+    canvas.alpha_composite(shadow_layer)
+    canvas.paste(cutout_rgba, (0, 0), cutout_rgba)
 
     final_rgb = canvas.convert("RGB")
     buf = io.BytesIO()
-    final_rgb.save(buf, format="JPEG", quality=88, optimize=True)
+    final_rgb.save(buf, format="JPEG", quality=95, optimize=True)
+    return buf.getvalue()
+
+def process_local_cutout_and_shadow(orig_img: Image.Image) -> bytes:
+    """Локальное вырезание фона без искусственного сжатия и без изменения исходного масштаба."""
+    orig_w, orig_h = orig_img.size
+    rgba_img = orig_img.convert("RGBA")
+
+    border_pts = []
+    step_x = max(1, orig_w // 30)
+    step_y = max(1, orig_h // 30)
+    for x in range(0, orig_w, step_x):
+        border_pts.append(rgba_img.getpixel((x, 0))[:3])
+        border_pts.append(rgba_img.getpixel((x, orig_h - 1))[:3])
+    for y in range(0, orig_h, step_y):
+        border_pts.append(rgba_img.getpixel((0, y))[:3])
+        border_pts.append(rgba_img.getpixel((orig_w - 1, y))[:3])
+
+    avg_r = sum(p[0] for p in border_pts) // len(border_pts)
+    avg_g = sum(p[1] for p in border_pts) // len(border_pts)
+    avg_b = sum(p[2] for p in border_pts) // len(border_pts)
+
+    variance = sum((p[0] - avg_r)**2 + (p[1] - avg_g)**2 + (p[2] - avg_b)**2 for p in border_pts) / len(border_pts)
+
+    if variance < 2200:
+        small_w = max(50, orig_w // 2)
+        small_h = max(50, orig_h // 2)
+        small_img = rgba_img.resize((small_w, small_h), Image.Resampling.BILINEAR)
+        pix = small_img.load()
+        mask_data = []
+
+        for y in range(small_h):
+            for x in range(small_w):
+                pr, pg, pb = pix[x, y][:3]
+                c_dist = ((pr - avg_r)**2 + (pg - avg_g)**2 + (pb - avg_b)**2)**0.5
+                if c_dist < 40:
+                    mask_data.append(0)
+                elif c_dist < 65:
+                    mask_data.append(int(((c_dist - 40) / 25.0) * 255))
+                else:
+                    mask_data.append(255)
+
+        small_mask = Image.new("L", (small_w, small_h))
+        small_mask.putdata(mask_data)
+        full_mask = small_mask.resize((orig_w, orig_h), Image.Resampling.LANCZOS).filter(ImageFilter.GaussianBlur(radius=2))
+        rgba_img.putalpha(full_mask)
+        return render_exact_frame_studio(rgba_img, (orig_w, orig_h))
+
+    buf = io.BytesIO()
+    orig_img.save(buf, format="JPEG", quality=95, optimize=True)
     return buf.getvalue()
 
 def process_all_studio_photos_sync(photos_bytes: list[bytes], api_key: str = "") -> list[bytes]:
-    """Последовательно генерирует 3 студийные фотографии на чистом белом фоне."""
+    """Обрабатывает фото в оригинальном масштабе каждого кадра без обрезки и отдаления."""
     results = []
     for raw in photos_bytes:
         try:
@@ -934,22 +885,39 @@ def generate_marketplace_links(query_local: str, query_global: str) -> dict[str,
     }
 
 def prepare_image_bytes_sync(file_bytes: bytes) -> bytes:
-    """Конвейерная подготовка фото: мгновенное выравнивание EXIF и оптимизация в JPEG."""
+    """Конвейерная подготовка фото для AI: быстрое выравнивание EXIF и оптимизация в 750px."""
     with Image.open(io.BytesIO(file_bytes)) as img:
         img = ImageOps.exif_transpose(img)
         img = img.convert("RGB")
-        # 750px обеспечивает идеальную четкость артикулов и на 40% ускоряет работу нейросети
         img.thumbnail((750, 750), Image.Resampling.BILINEAR)
         out_buf = io.BytesIO()
         img.save(out_buf, format="JPEG", quality=70, optimize=False)
         return out_buf.getvalue()
 
+def prepare_highres_bytes_sync(file_bytes: bytes) -> bytes:
+    """Подготовка полноразмерного фото для фотокарточки: сохраняет 100% четкость и детали ткани."""
+    with Image.open(io.BytesIO(file_bytes)) as img:
+        img = ImageOps.exif_transpose(img)
+        img = img.convert("RGB")
+        if max(img.size) > 2000:
+            img.thumbnail((2000, 2000), Image.Resampling.LANCZOS)
+        out_buf = io.BytesIO()
+        img.save(out_buf, format="JPEG", quality=95, optimize=True)
+        return out_buf.getvalue()
+
 async def fetch_and_prep_bytes(bot_instance: Bot, file_id: str) -> bytes:
-    """Асинхронно скачивает и пережимает фото на лету."""
+    """Асинхронно скачивает и пережимает фото для быстрого анализа AI."""
     file_info = await bot_instance.get_file(file_id)
     stream = io.BytesIO()
     await bot_instance.download_file(file_info.file_path, destination=stream)
     return await asyncio.to_thread(prepare_image_bytes_sync, stream.getvalue())
+
+async def fetch_highres_bytes(bot_instance: Bot, file_id: str) -> bytes:
+    """Асинхронно скачивает фото в максимальном исходном качестве для фотокарточки."""
+    file_info = await bot_instance.get_file(file_id)
+    stream = io.BytesIO()
+    await bot_instance.download_file(file_info.file_path, destination=stream)
+    return await asyncio.to_thread(prepare_highres_bytes_sync, stream.getvalue())
 
 def safe_int(val, default: int = 50) -> int:
     """Безопасно преобразует любое значение (число, строку с % или текстом) в int."""
@@ -973,13 +941,11 @@ def extract_clean_json(text: str) -> dict:
     if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
         cleaned = cleaned[start_idx:end_idx + 1]
 
-    # Попытка 1: стандартный JSON
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError:
         pass
 
-    # Попытка 2: очистка висячих запятых и внутренних кавычек
     try:
         fixed = re.sub(r",\s*([}\]])", r"\1", cleaned)
         fixed = re.sub(r'(:\s*")([^"]*)"([^"]*)(")', r"\1\2'\3\4", fixed)
@@ -987,7 +953,6 @@ def extract_clean_json(text: str) -> dict:
     except Exception:
         pass
 
-    # Попытка 3: аварийное извлечение полей регулярными выражениями (никогда не падает)
     fallback_data = {}
     brand_match = re.search(r'["\']brand["\']\s*:\s*["\']([^"\']+)["\']', cleaned, re.IGNORECASE)
     model_match = re.search(r'["\']item_name["\']\s*:\s*["\']([^"\']+)["\']', cleaned, re.IGNORECASE)
@@ -1023,7 +988,6 @@ async def analyze_with_gemini_fallback(image_parts: list[genai_types.Part]) -> d
 
     models_to_try = await asyncio.to_thread(get_candidate_models)
     
-    # Резервная цепочка: быстрый gemini-2.0-flash в приоритете
     fallback_chain = [
         "gemini-2.0-flash",
         "gemini-2.5-flash",
@@ -1063,7 +1027,6 @@ async def analyze_with_gemini_fallback(image_parts: list[genai_types.Part]) -> d
         try:
             logger.info(f"Отправка запроса к модели {model_name}...")
             
-            # Конфигурация генерации: отключаем thinking-задержку для экономии 15-20 сек
             gen_config = genai_types.GenerateContentConfig(
                 response_mime_type="application/json",
                 temperature=0.1,
@@ -1153,7 +1116,6 @@ async def cmd_start(message: Message, state: FSMContext):
     username = message.from_user.username
     name = html.escape(message.from_user.first_name or "Пользователь")
 
-    # Обработка реферальных ссылок: /start ref_123456789
     command_parts = message.text.split(maxsplit=1)
     if len(command_parts) > 1:
         param = command_parts[1].strip()
@@ -1162,7 +1124,6 @@ async def cmd_start(message: Message, state: FSMContext):
             if ref_id_str.isdigit():
                 referrer_id = int(ref_id_str)
                 if referrer_id != user_id:
-                    # Проверяем, был ли пользователь зарегистрирован ранее
                     existing_user = query_db("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
                     existing_ref = query_db("SELECT id FROM user_referrals WHERE referred_user_id = ?", (user_id,))
                     if not existing_user and not existing_ref:
@@ -1190,7 +1151,6 @@ async def cmd_start(message: Message, state: FSMContext):
     is_sub = await check_channel_subscription(user_id)
     u = get_user_data(user_id, username, is_subscribed=is_sub)
 
-    # Обязательная подписка на канал
     if not is_sub:
         sub_text = (
             f"👋 Привет, <b>{name}</b>!\n\n"
@@ -1259,7 +1219,6 @@ async def cb_show_referral(callback: CallbackQuery):
     bot_username = bot_info.username if bot_info else "Cimee_bot"
     ref_link = f"https://t.me/{bot_username}?start=ref_{user_id}"
 
-    # Подсчитываем статистику приглашений
     tot_rows = query_db("SELECT COUNT(*) as cnt FROM user_referrals WHERE referrer_id = ?", (user_id,))
     rew_rows = query_db("SELECT COUNT(*) as cnt FROM user_referrals WHERE referrer_id = ? AND reward_given = 1", (user_id,))
 
@@ -1457,7 +1416,6 @@ async def cb_check_monobank_statement(callback: CallbackQuery):
     plan = PLANS.get(plan_key)
     user_id = callback.from_user.id
 
-    # Предотвращаем параллельные проверки одного и того же платежа
     if user_id in CHECKING_PAYMENTS:
         await callback.answer("⏳ Уже проверяю поступление, пожалуйста подождите...", show_alert=False)
         return
@@ -1466,7 +1424,6 @@ async def cb_check_monobank_statement(callback: CallbackQuery):
     await callback.answer("Проверяю поступления на Банку...", show_alert=False)
 
     try:
-        # Проверяем, не была ли оплата уже зачислена ранее
         recent_cutoff = (datetime.now() - timedelta(minutes=60)).isoformat()
         already_paid = query_db(
             "SELECT * FROM processed_transactions WHERE user_id = ? AND created_at >= ?",
@@ -1578,11 +1535,10 @@ async def cb_check_monobank_statement(callback: CallbackQuery):
                         [InlineKeyboardButton(text="◀️ В главное меню", callback_data="back_to_main")]
                     ])
 
-                    # Заменяем старое сообщение с кнопками оплаты, исключая повторные нажатия
                     try:
                         await callback.message.edit_text(success_text, parse_mode="HTML", reply_markup=success_kb)
                     except Exception:
-                        await callback.message.answer(success_text, parse_mode="HTML", reply_markup=success_kb)
+                        await callback.message.answer(success_already_text, parse_mode="HTML", reply_markup=success_kb)
 
                     if bot:
                         username_str = f"@{callback.from_user.username}" if callback.from_user.username else f"ID: {user_id}"
@@ -1992,7 +1948,7 @@ async def cmd_dellblog(message: Message):
 
     if not found:
         await message.answer(
-            f"❌ Блогер с ником или промокодом <b>{html.escape(raw_tag)}</b> не найден в базе данных.",
+            f"❌ Блогер с ником или промокод <b>{html.escape(raw_tag)}</b> не найден в базе данных.",
             parse_mode="HTML"
         )
         return
@@ -2558,7 +2514,6 @@ async def cb_confirm_broadcast(callback: CallbackQuery, state: FSMContext):
             else:
                 error_count += 1
 
-        # Задержка для соблюдения лимитов Telegram API (до 30 сообщений в секунду)
         await asyncio.sleep(0.04)
 
         if idx % 50 == 0 and progress_msg:
@@ -2716,7 +2671,6 @@ async def cb_start_check(callback: CallbackQuery, state: FSMContext):
 
 @dp.message(StateFilter(ClothingCheckFSM.waiting_for_main_photo), F.photo)
 async def process_main_photo(message: Message, state: FSMContext):
-    # Фоновая загрузка и сжатие первого фото прямо во время шага 1
     if bot:
         p1_bytes = await fetch_and_prep_bytes(bot, message.photo[-1].file_id)
         await state.update_data(photo_1_bytes=p1_bytes)
@@ -2730,7 +2684,6 @@ async def process_main_photo(message: Message, state: FSMContext):
 
 @dp.message(StateFilter(ClothingCheckFSM.waiting_for_neck_tag), F.photo)
 async def process_neck_tag_photo(message: Message, state: FSMContext):
-    # Фоновая загрузка и сжатие второго фото прямо во время шага 2
     if bot:
         p2_bytes = await fetch_and_prep_bytes(bot, message.photo[-1].file_id)
         await state.update_data(photo_2_bytes=p2_bytes)
@@ -2756,7 +2709,6 @@ async def process_care_tag_photo(message: Message, state: FSMContext):
         if not bot:
             raise RuntimeError("Telegram Bot instance not ready")
 
-        # Первые два фото уже пережаты и лежат в памяти; готовим только третье
         p3_bytes = await fetch_and_prep_bytes(bot, message.photo[-1].file_id)
         p1_bytes = user_data.get("photo_1_bytes")
         p2_bytes = user_data.get("photo_2_bytes")
@@ -2795,7 +2747,6 @@ async def process_care_tag_photo(message: Message, state: FSMContext):
 
         reasons_formatted = "\n".join([f"  • {html.escape(r)}" for r in reasons_list]) if reasons_list else "  • Детали и фурнитура соответствуют стандартам бренда"
 
-        # Безопасное приведение числовых значений (защита от падения TypeError)
         score = safe_int(data.get("authenticity_score"), 75)
         score_emoji = "🟢" if score >= 75 else ("🟡" if score >= 45 else "🔴")
 
@@ -2804,7 +2755,6 @@ async def process_care_tag_photo(message: Message, state: FSMContext):
         price_usd_min = safe_int(data.get("price_usd_min"), 10)
         price_usd_max = safe_int(data.get("price_usd_max"), 20)
 
-        # Сохраняем сырые данные, фото и сформированную карточку с юзернеймом автора
         USER_CHECK_DATA[message.from_user.id] = data
         USER_CHECK_PHOTOS[message.from_user.id] = [p1_bytes, p2_bytes, p3_bytes]
         USER_SALES_CARDS[message.from_user.id] = build_sales_card_text(data, message.from_user.username)
@@ -2946,7 +2896,7 @@ async def cb_start_photocard(callback: CallbackQuery, state: FSMContext):
     await callback.message.answer(
         "📸 <b>Создание студийной фотокарточки (Шаг 1 из 3)</b>\n\n"
         "Отправьте <b>первое фото вещи</b> (любой ракурс, какой вы хотите для продажи — например, общий вид спереди).\n\n"
-        "<i>Бот вырежет фон на всех 3 фото, оформит их в студийном формате 1080x1080 с тенью и сгенерирует описание.</i>",
+        "<i>Бот вырежет фон, сохранит оригинальный масштаб фото и сгенерирует готовый продающий текст.</i>",
         parse_mode="HTML",
         reply_markup=cancel_kb
     )
@@ -2954,7 +2904,7 @@ async def cb_start_photocard(callback: CallbackQuery, state: FSMContext):
 @dp.message(StateFilter(PhotoCardFSM.waiting_for_photo_1), F.photo)
 async def process_photocard_photo_1(message: Message, state: FSMContext):
     if bot:
-        p1_bytes = await fetch_and_prep_bytes(bot, message.photo[-1].file_id)
+        p1_bytes = await fetch_highres_bytes(bot, message.photo[-1].file_id)
         await state.update_data(pc_photo_1=p1_bytes)
 
     await state.set_state(PhotoCardFSM.waiting_for_photo_2)
@@ -2971,7 +2921,7 @@ async def process_photocard_photo_1(message: Message, state: FSMContext):
 @dp.message(StateFilter(PhotoCardFSM.waiting_for_photo_2), F.photo)
 async def process_photocard_photo_2(message: Message, state: FSMContext):
     if bot:
-        p2_bytes = await fetch_and_prep_bytes(bot, message.photo[-1].file_id)
+        p2_bytes = await fetch_highres_bytes(bot, message.photo[-1].file_id)
         await state.update_data(pc_photo_2=p2_bytes)
 
     await state.set_state(PhotoCardFSM.waiting_for_photo_3)
@@ -2992,7 +2942,7 @@ async def process_photocard_photo_3(message: Message, state: FSMContext):
 
     status_msg = await message.answer(
         "🎨 <b>Створюю студійні фото товару на білому фоні з тінню...</b>\n"
-        "Обробляю 3 фотографії, вирізаю фон та формую картку для продажу.",
+        "Обробляю 3 фотографії, вирізаю фон у повному масштабі та формую картку для продажу.",
         parse_mode="HTML"
     )
 
@@ -3000,24 +2950,26 @@ async def process_photocard_photo_3(message: Message, state: FSMContext):
         if not bot:
             raise RuntimeError("Telegram Bot instance not ready")
 
-        p3_bytes = await fetch_and_prep_bytes(bot, message.photo[-1].file_id)
+        p3_bytes = await fetch_highres_bytes(bot, message.photo[-1].file_id)
         p1_bytes = user_data.get("pc_photo_1")
         p2_bytes = user_data.get("pc_photo_2")
 
         if not p1_bytes or not p2_bytes:
             raise ValueError("Не вдалося завантажити попередні фото. Будь ласка, почніть створення картки заново.")
 
-        # Списываем 1 проверку за генерацию студийной фотокарточки
         await decrement_check(message.from_user.id)
 
-        # Запускаем параллельно обработку 3 фото и определение параметров через AI
         photos = [p1_bytes, p2_bytes, p3_bytes]
         studio_images_task = asyncio.to_thread(process_all_studio_photos_sync, photos, REMOVE_BG_API_KEY)
 
+        p1_thumb = prepare_image_bytes_sync(p1_bytes)
+        p2_thumb = prepare_image_bytes_sync(p2_bytes)
+        p3_thumb = prepare_image_bytes_sync(p3_bytes)
+
         image_parts = [
-            genai_types.Part.from_bytes(data=p1_bytes, mime_type="image/jpeg"),
-            genai_types.Part.from_bytes(data=p2_bytes, mime_type="image/jpeg"),
-            genai_types.Part.from_bytes(data=p3_bytes, mime_type="image/jpeg")
+            genai_types.Part.from_bytes(data=p1_thumb, mime_type="image/jpeg"),
+            genai_types.Part.from_bytes(data=p2_thumb, mime_type="image/jpeg"),
+            genai_types.Part.from_bytes(data=p3_thumb, mime_type="image/jpeg")
         ]
 
         try:
@@ -3037,7 +2989,6 @@ async def process_photocard_photo_3(message: Message, state: FSMContext):
         studio_images = await studio_images_task
         card_text = build_sales_card_text(detected_data, message.from_user.username)
 
-        # Отправляем 3 студийные фотографии альбомом
         caption_for_album = f"📋 <b>Картка товару:</b>\n\n<code>{html.escape(card_text)}</code>" if len(card_text) < 950 else None
         media_group = [
             InputMediaPhoto(
@@ -3055,7 +3006,6 @@ async def process_photocard_photo_3(message: Message, state: FSMContext):
 
         await bot.send_media_group(chat_id=message.chat.id, media=media_group)
 
-        # Отправляем блок для мгновенного копирования текста
         reply_text = (
             "📋 <b>Готова картка для продажу</b>\n"
             "<i>(Натисніть на текст нижче в сірому полі, щоб скопіювати його в 1 клік):</i>\n\n"
