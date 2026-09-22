@@ -652,6 +652,21 @@ USER_SALES_CARDS: dict[int, str] = {}
 USER_CHECK_DATA: dict[int, dict] = {}
 USER_CHECK_PHOTOS: dict[int, list[bytes]] = {}
 
+# Мягкий нейтральный сероватый студийный фон (Farfetch / Grailed стиль), не слепит глаза
+STUDIO_BG_COLOR = (241, 242, 245, 255)
+
+# Промпт для Gemini / Imagen: 100% сохранение дефектов вещи, разглаживание складок и мягкий серый фон
+AI_STUDIO_FLAT_LAY_PROMPT = (
+    "High-end commercial product photography of the exact clothing garment from the reference. "
+    "CRITICAL FIDELITY RULES: Maintain 100% authenticity and real condition of the garment. "
+    "Do NOT hide, erase, or alter any real visible defects, scratches, fabric wear, distressing, fading, or vintage patina. "
+    "Every brand embroidery, patch, zipper, button, and care tag must remain completely intact and authentic. "
+    "PRESENTATION & LAYOUT: Neatly smooth out accidental messy wrinkles and folds from laying down, aligning sleeves and body "
+    "into a professional, symmetrical flat-lay fashion catalog display. "
+    "STUDIO BACKDROP: Seamless neutral soft-gray matte studio tabletop (HEX #F1F2F5, RGB 241, 242, 245 - NOT harsh blinding white). "
+    "Soft balanced directional light with natural diffuse contact and ambient drop shadows beneath the garment."
+)
+
 def build_sales_card_text(data: dict, username: Optional[str] = None) -> str:
     """Формирует карточку продажи строго по заданному формату на украинском языке."""
     brand = str(data.get("brand") or "Бренд").strip()
@@ -690,13 +705,46 @@ def build_sales_card_text(data: dict, username: Optional[str] = None) -> str:
 
     return "\n".join(lines)
 
+def render_exact_frame_studio(cutout_rgba: Image.Image, size: tuple[int, int]) -> bytes:
+    """Размещает вещь на мягком сероватом фоне #F1F2F5 с реалистичной двойной тенью (контактная + рассеянная)."""
+    orig_w, orig_h = size
+    canvas = Image.new("RGBA", (orig_w, orig_h), STUDIO_BG_COLOR)
+    alpha = cutout_rgba.split()[3]
+
+    # 1. Мягкая рассеянная амбиентная тень (создает объем и расстояние от стола)
+    ambient_mask = Image.new("L", (orig_w, orig_h), 0)
+    ambient_offset_y = max(6, int(orig_h * 0.016))
+    ambient_mask.paste(alpha, (0, ambient_offset_y))
+    ambient_blurred = ambient_mask.filter(ImageFilter.GaussianBlur(radius=max(8, int(min(orig_w, orig_h) * 0.024))))
+
+    ambient_shadow = Image.new("RGBA", (orig_w, orig_h), (25, 28, 35, 0))
+    ambient_shadow.putalpha(ambient_blurred.point(lambda p: int(p * 0.20)))
+
+    # 2. Плотная контактная тень (непосредственно под вещью, чтобы она не «летала» в воздухе)
+    contact_mask = Image.new("L", (orig_w, orig_h), 0)
+    contact_offset_y = max(3, int(orig_h * 0.006))
+    contact_mask.paste(alpha, (0, contact_offset_y))
+    contact_blurred = contact_mask.filter(ImageFilter.GaussianBlur(radius=max(3, int(min(orig_w, orig_h) * 0.008))))
+
+    contact_shadow = Image.new("RGBA", (orig_w, orig_h), (15, 18, 22, 0))
+    contact_shadow.putalpha(contact_blurred.point(lambda p: int(p * 0.26)))
+
+    canvas.alpha_composite(ambient_shadow)
+    canvas.alpha_composite(contact_shadow)
+    canvas.paste(cutout_rgba, (0, 0), cutout_rgba)
+
+    final_rgb = canvas.convert("RGB")
+    buf = io.BytesIO()
+    final_rgb.save(buf, format="JPEG", quality=95, optimize=True)
+    return buf.getvalue()
+
 def create_studio_photo_sync(image_bytes: bytes, api_key: str = "") -> bytes:
-    """Трансформирует фото в студийный формат БЕЗ отдаления: точный исходный масштаб кадра на белом фоне."""
+    """Трансформирует фото в студийный формат на матовом сером фоне без отдаления и с идеальной четкостью."""
     with Image.open(io.BytesIO(image_bytes)) as raw_img:
         orig_img = ImageOps.exif_transpose(raw_img).convert("RGB")
         orig_w, orig_h = orig_img.size
 
-    # 1. Если подключен Remove.bg API — получаем маску и накладываем на оригинальное полноразмерное фото
+    # 1. Попытка вырезать фон через Remove.bg API и наложить на матовый серый фон
     if api_key:
         try:
             with httpx.Client(timeout=15.0) as client:
@@ -716,37 +764,13 @@ def create_studio_photo_sync(image_bytes: bytes, api_key: str = "") -> bytes:
                         cutout_full.putalpha(alpha)
                         return render_exact_frame_studio(cutout_full, (orig_w, orig_h))
         except Exception as api_err:
-            logger.warning(f"Внешний Remove.bg API недоступен ({api_err}), переключаемся на локальную обработку.")
+            logger.warning(f"Remove.bg API недоступен ({api_err}), переключаемся на локальную обработку.")
 
-    # 2. Локальный движок (без изменения масштаба и без отдаления)
+    # 2. Локальный движок (вырезание однородного фона или оформление на сером фоне)
     return process_local_cutout_and_shadow(orig_img)
 
-def render_exact_frame_studio(cutout_rgba: Image.Image, size: tuple[int, int]) -> bytes:
-    """Размещает вещь в ТОЧНОМ исходном положении и масштабе на белом фоне с естественной мягкой тенью."""
-    orig_w, orig_h = size
-    canvas = Image.new("RGBA", (orig_w, orig_h), (255, 255, 255, 255))
-    alpha = cutout_rgba.split()[3]
-
-    shadow_mask = Image.new("L", (orig_w, orig_h), 0)
-    shadow_offset_y = max(4, int(orig_h * 0.012))
-    shadow_mask.paste(alpha, (0, shadow_offset_y))
-
-    blur_radius = max(6, int(min(orig_w, orig_h) * 0.018))
-    blurred_shadow = shadow_mask.filter(ImageFilter.GaussianBlur(radius=blur_radius))
-
-    shadow_layer = Image.new("RGBA", (orig_w, orig_h), (25, 25, 30, 0))
-    shadow_layer.putalpha(blurred_shadow.point(lambda p: int(p * 0.28)))
-
-    canvas.alpha_composite(shadow_layer)
-    canvas.paste(cutout_rgba, (0, 0), cutout_rgba)
-
-    final_rgb = canvas.convert("RGB")
-    buf = io.BytesIO()
-    final_rgb.save(buf, format="JPEG", quality=95, optimize=True)
-    return buf.getvalue()
-
 def process_local_cutout_and_shadow(orig_img: Image.Image) -> bytes:
-    """Локальное вырезание фона без искусственного сжатия и без изменения исходного масштаба."""
+    """Локальное вырезание фона без изменения масштаба с размещением на мягком сером фоне."""
     orig_w, orig_h = orig_img.size
     rgba_img = orig_img.convert("RGBA")
 
